@@ -1,0 +1,11 @@
+latency_mode: complete
+queue:
+  max_frames: 256
+  max_buffered_duration_us: 25600000
+  max_model_backlog_us: 30000000
+  overflow_behavior: block_producer
+routing:
+  mute_original: true
+  exclude_tts_from_capture: true
+playback:
+  skip_stale_speech: false

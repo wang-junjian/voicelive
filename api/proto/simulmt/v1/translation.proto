@@ -1,0 +1,50 @@
+syntax = "proto3";
+package simulmt.api.v1;
+import "simulmt/v1/audio.proto";
+
+message TranslationConfig {
+  string source_language = 1;
+  string target_language = 2;
+  string model_profile = 3;
+  string latency_mode = 4;
+  map<string, string> provider_options = 5;
+}
+
+enum TranslationEventType {
+  TRANSLATION_EVENT_TYPE_UNSPECIFIED = 0;
+  APPEND = 1;
+  REVISE = 2;
+  FINAL = 3;
+  RESET = 4;
+}
+
+message TranslationEvent {
+  string session_id = 1;
+  uint64 epoch = 2;
+  string segment_id = 3;
+  uint64 revision = 4;
+  TranslationEventType event_type = 5;
+  string source_text = 6;
+  string translated_text = 7;
+  optional int64 source_start_ns = 8;
+  optional int64 source_end_ns = 9;
+  int64 generation_started_ns = 10;
+  int64 generation_finished_ns = 11;
+  uint32 generation_duration_us = 12;
+  bool speakable = 13;
+}
+
+message SubtitleCue {
+  string cue_id = 1;
+  uint64 revision = 2;
+  string source_text = 3;
+  string translated_text = 4;
+  int64 source_start_ns = 5;
+  int64 source_end_ns = 6;
+  bool is_final = 7;
+  repeated string segment_ids = 8;
+}
+
+service TranslatorWorker {
+  rpc Translate(stream AudioFrame) returns (stream TranslationEvent);
+}

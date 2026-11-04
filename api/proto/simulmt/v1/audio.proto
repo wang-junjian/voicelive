@@ -1,0 +1,40 @@
+syntax = "proto3";
+package simulmt.api.v1;
+
+enum SampleEncoding {
+  SAMPLE_ENCODING_UNSPECIFIED = 0;
+  PCM_S16LE = 1;
+  PCM_F32LE = 2;
+}
+
+message AudioFormat {
+  uint32 sample_rate = 1;
+  uint32 channels = 2;
+  SampleEncoding encoding = 3;
+  uint32 frame_duration_us = 4;
+}
+
+message AudioFrame {
+  string session_id = 1;
+  uint64 epoch = 2;
+  uint64 sequence = 3;
+  string source_id = 4;
+  AudioFormat format = 5;
+  bytes payload = 6;
+  optional int64 source_pts_ns = 7;
+  int64 capture_mono_ns = 8;
+  int64 ingress_mono_ns = 9;
+  uint32 duration_us = 10;
+  bool discontinuity = 11;
+}
+
+message SourceInfo {
+  string source_id = 1;
+  string kind = 2;
+  string name = 3;
+  optional uint32 pid = 4;
+  optional string bundle_id = 5;
+  bool can_mute = 6;
+  bool can_exclude_sink = 7;
+  bool is_running = 8;
+}

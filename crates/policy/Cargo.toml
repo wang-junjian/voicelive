@@ -1,0 +1,12 @@
+[package]
+name = "simulmt-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+simulmt-api = { path = "../api" }
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

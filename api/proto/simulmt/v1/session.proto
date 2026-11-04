@@ -1,0 +1,42 @@
+syntax = "proto3";
+package simulmt.api.v1;
+import "simulmt/v1/audio.proto";
+import "simulmt/v1/common.proto";
+import "simulmt/v1/translation.proto";
+import "simulmt/v1/playback.proto";
+
+message PipelineConfig {
+  string source_json = 1;
+  string translator_json = 2;
+  string output_json = 3;
+  string latency_mode = 4;
+  QueuePolicy queue = 5;
+  bool mute_original = 6;
+}
+
+message CreateSessionRequest { PipelineConfig config = 1; }
+message SessionRef { string session_id = 1; }
+message StopRequest { string session_id = 1; bool drain = 2; }
+
+message SessionEvent {
+  string api_version = 1;
+  string session_id = 2;
+  uint64 epoch = 3;
+  int64 emitted_mono_ns = 4;
+  string event_type = 5;
+  string state = 6;
+  TranslationEvent translation = 7;
+  PlaybackEvent playback = 8;
+  string message = 9;
+  SubtitleCue subtitle = 10;
+}
+
+service SessionService {
+  rpc CreateSession(CreateSessionRequest) returns (SessionRef);
+  rpc PrepareSession(SessionRef) returns (SessionEvent);
+  rpc StartSession(SessionRef) returns (SessionEvent);
+  rpc PauseSession(SessionRef) returns (SessionEvent);
+  rpc ResumeSession(SessionRef) returns (SessionEvent);
+  rpc StopSession(StopRequest) returns (SessionEvent);
+  rpc SubscribeSessionEvents(SessionRef) returns (stream SessionEvent);
+}

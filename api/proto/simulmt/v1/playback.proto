@@ -1,0 +1,52 @@
+syntax = "proto3";
+package simulmt.api.v1;
+
+message SpeechRequest {
+  string session_id = 1;
+  uint64 epoch = 2;
+  string segment_id = 3;
+  uint64 revision = 4;
+  string text = 5;
+  string language = 6;
+  string voice = 7;
+  double rate = 8;
+  int64 deadline_mono_ns = 9;
+}
+
+message PlaybackCommand {
+  string session_id = 1;
+  uint64 epoch = 2;
+  string command = 3;
+  optional string segment_id = 4;
+  optional double value = 5;
+}
+
+message PlaybackEvent {
+  string session_id = 1;
+  uint64 epoch = 2;
+  string segment_id = 3;
+  uint64 token = 4;
+  string event_type = 5;
+  uint64 queue_duration_us = 6;
+  optional int64 actual_start_mono_ns = 7;
+  optional int64 source_end_ns = 8;
+}
+
+service SynthesizerWorker {
+  rpc Synthesize(stream SpeechRequest) returns (stream AudioChunk);
+}
+
+service AudioSinkWorker {
+  rpc Control(stream PlaybackCommand) returns (stream PlaybackEvent);
+}
+
+message AudioChunk {
+  string session_id = 1;
+  uint64 epoch = 2;
+  string segment_id = 3;
+  uint64 sequence = 4;
+  bytes payload = 5;
+  uint32 sample_rate = 6;
+  uint32 channels = 7;
+  bool end_of_stream = 8;
+}

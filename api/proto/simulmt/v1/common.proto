@@ -1,0 +1,27 @@
+syntax = "proto3";
+package simulmt.api.v1;
+
+message ComponentInfo {
+  string component_id = 1;
+  string kind = 2;
+  string name = 3;
+  string version = 4;
+  string capabilities_json = 5;
+  string health = 6;
+}
+
+message ErrorInfo {
+  string code = 1;
+  string component_id = 2;
+  string message = 3;
+  bool retryable = 4;
+  bool fatal = 5;
+  string request_id = 6;
+}
+
+message QueuePolicy {
+  uint32 max_frames = 1;
+  uint32 max_buffered_duration_us = 2;
+  uint32 max_model_backlog_us = 3;
+  string overflow_behavior = 4;
+}

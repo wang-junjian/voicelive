@@ -1,0 +1,13 @@
+syntax = "proto3";
+package simulmt.api.v1;
+import "simulmt/v1/audio.proto";
+import "simulmt/v1/common.proto";
+
+message Empty {}
+message ComponentList { repeated ComponentInfo components = 1; }
+message SourceList { repeated SourceInfo sources = 1; }
+
+service CatalogService {
+  rpc ListComponents(Empty) returns (ComponentList);
+  rpc ListSources(Empty) returns (SourceList);
+}

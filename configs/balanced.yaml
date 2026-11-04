@@ -1,0 +1,9 @@
+latency_mode: balanced
+queue:
+  max_frames: 64
+  max_buffered_duration_us: 6400000
+  max_model_backlog_us: 10000000
+  overflow_behavior: drop_newest_audio
+routing:
+  mute_original: true
+  exclude_tts_from_capture: true
