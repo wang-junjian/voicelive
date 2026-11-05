@@ -81,8 +81,8 @@ SourceConfig → RunningSource → AudioFrame（100 ms）
 
 - 模型启动与采集启动分离：`prepare` 进入 `Ready`，`start` 才创建播放器和音源；`stop` 只停止采集/播放并保留模型，`stop_model` 才终止模型、递增 epoch 并回到 `Idle`。
 - 全局只有一个常驻模型。`SessionManager::prepare` 会将其他会话的 `Ready` 模型 detach/adopt 到新会话；`RunningTranslator::reattach` 重定向事件并清理音频和语言上下文，避免重复加载权重。新建会话也会停止其他会话的活动采集。
-- 字幕 JSONL 采用追加记录、读取时按 `cue_id` 折叠修订。内存历史最多 512 条，但磁盘历史完整保留；会话清单原子写入。重启只恢复配置、元数据和字幕，所有运行状态恢复为 `Idle`，不会恢复进程或 Tap。
-- 默认持久化位置为 `runtime/sessions/`、`runtime/subtitles/`，媒体、模型日志和 TTS 缓存也在 `runtime/` 下。
+- `runtime/echonote.db` 使用 SQLite WAL、单写入连接和 `synchronous=FULL`，保存会话、字幕修订、segment 关联、语音清单和迁移账本；WAV/媒体仍存文件系统。字幕与播放状态先提交数据库再广播。内存历史最多 512 条，数据库历史完整保留。重启只恢复配置、元数据和字幕，所有运行状态恢复为 `Idle`，不会恢复进程或 Tap。
+- 旧 `runtime/sessions/*.json`、`runtime/subtitles/*.jsonl` 和已有语音 WAV 在启动时只读迁移并保留原文件；迁移按 revision/timeline 重置拆分重复旧 cue，使用确定性 UUID 和逐行账本保证可重入。媒体、模型日志和 TTS 缓存也在 `runtime/` 下。
 
 ### 3. 适配器与原生进程协议
 

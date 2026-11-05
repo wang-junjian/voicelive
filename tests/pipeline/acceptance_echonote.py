@@ -223,14 +223,22 @@ def main():
             }
             export_session = request("/api/sessions", "POST", export_config)
             export_id = export_session["session_id"]
+            core.stop()
             cache = runtime / "cache"
             cache.mkdir(exist_ok=True)
+            # Simulate a crash after the native player wrote WAV files but before
+            # Core persisted their speech rows. No legacy manifest is present.
             segment = cache / f"speech-{export_id}-1.wav"
+            third_segment = cache / f"speech-{export_id}-3.wav"
             segment.write_bytes(decoded.read_bytes())
+            third_segment.write_bytes(decoded.read_bytes())
+            core.start()
             exported = request(f"/api/sessions/{export_id}/export.wav")
-            assert exported.startswith(b"RIFF") and len(exported) > 44
+            assert exported.startswith(b"RIFF")
+            assert len(exported) > len(decoded.read_bytes())
             request(f"/api/sessions/{export_id}", "DELETE")
             assert not segment.exists()
+            assert not third_segment.exists()
 
             print(
                 json.dumps(

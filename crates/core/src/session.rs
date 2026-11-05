@@ -3,6 +3,7 @@ use crate::lifecycle::Lifecycle;
 use crate::output::{OutputRunner, OutputSignal, PlaybackControl};
 use crate::source::RunningSource;
 use crate::source::{SourceEvent, SourceStartOptions, start_source};
+use crate::store::{SessionMetadata, Store, StoredSession};
 use crate::time::monotonic_ns;
 use crate::translator::{RunningTranslator, TranslatorSignal, start_translator};
 use simulmt_api::*;
@@ -12,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -24,33 +24,20 @@ pub struct CoreOptions {
     pub runtime_dir: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct SessionMetadata {
-    title: String,
-    created_at_ms: i64,
-    started_at_ms: Option<i64>,
-    ended_at_ms: Option<i64>,
-    #[serde(default)]
-    audio_duration_us: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StoredSession {
-    id: Uuid,
-    config: PipelineConfig,
-    metadata: SessionMetadata,
-}
-
 pub struct SessionManager {
     options: CoreOptions,
+    store: Arc<Store>,
     sessions: Mutex<HashMap<Uuid, Arc<Session>>>,
     model_gate: Mutex<()>,
 }
 
 impl SessionManager {
     pub fn new(options: CoreOptions) -> Self {
+        let store = Store::open(std::path::Path::new(&options.runtime_dir))
+            .expect("open local session database");
         Self {
             options,
+            store,
             sessions: Mutex::new(HashMap::new()),
             model_gate: Mutex::new(()),
         }
@@ -58,26 +45,24 @@ impl SessionManager {
 
     /// Restores session metadata and configuration, never live capture or model processes.
     pub async fn load(options: CoreOptions) -> Result<Self> {
-        let manager = Self::new(options.clone());
-        let directory = PathBuf::from(&options.runtime_dir).join("sessions");
-        let mut entries = match tokio::fs::read_dir(&directory).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(manager),
-            Err(error) => return Err(error.into()),
+        let store = Store::open(std::path::Path::new(&options.runtime_dir))?;
+        store
+            .migrate_legacy(PathBuf::from(&options.runtime_dir))
+            .await?;
+        let manager = Self {
+            options: options.clone(),
+            store: Arc::clone(&store),
+            sessions: Mutex::new(HashMap::new()),
+            model_gate: Mutex::new(()),
         };
-        let mut restored = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            match tokio::fs::read_to_string(entry.path()).await {
-                Ok(contents) => match serde_json::from_str::<StoredSession>(&contents) {
-                    Ok(stored) => restored.push(Session::restore(stored, options.clone())),
-                    Err(error) => tracing::warn!("ignored invalid session manifest: {error}"),
-                },
-                Err(error) => tracing::warn!("failed to read session manifest: {error}"),
-            }
+        let stored_sessions = store.load_sessions().await?;
+        for stored in &stored_sessions {
+            store.recover_speech(stored.id).await?;
         }
+        let mut restored = stored_sessions
+            .into_iter()
+            .map(|stored| Session::restore_with_store(stored, options.clone(), Arc::clone(&store)))
+            .collect::<Vec<_>>();
         restored.sort_by_key(|session| session.metadata_created_at());
         let mut sessions = manager.sessions.lock().await;
         for session in restored {
@@ -87,16 +72,20 @@ impl SessionManager {
         Ok(manager)
     }
 
-    pub async fn create(&self, config: PipelineConfig) -> Arc<Session> {
+    pub async fn create(&self, config: PipelineConfig) -> Result<Arc<Session>> {
         // Creating a draft has no side effect on an active meeting. Capture ownership
         // changes only when prepare/start explicitly moves the resident model.
-        let session = Arc::new(Session::new(config, self.options.clone()));
-        session.persist().await;
+        let session = Arc::new(Session::new_with_store(
+            config,
+            self.options.clone(),
+            Arc::clone(&self.store),
+        ));
+        session.persist().await?;
         self.sessions
             .lock()
             .await
             .insert(session.id, Arc::clone(&session));
-        session
+        Ok(session)
     }
 
     pub async fn prepare(&self, id: Uuid) -> Result<Arc<Session>> {
@@ -197,8 +186,9 @@ impl SessionManager {
     pub async fn delete(&self, id: Uuid) -> Result<()> {
         let session = self.get(id).await?;
         session.stop_model().await?;
+        session.delete_files().await?;
         self.sessions.lock().await.remove(&id);
-        session.delete_files().await
+        Ok(())
     }
 
     pub async fn stop_all(&self) {
@@ -307,14 +297,23 @@ pub struct Session {
     runtime: Mutex<Option<Runtime>>,
     lifecycle: Lifecycle,
     subtitles: Mutex<SubtitleAssembler>,
+    subtitle_writes: Mutex<()>,
     history: Mutex<VecDeque<SubtitleCue>>,
     events: broadcast::Sender<SessionEvent>,
     options: CoreOptions,
+    store: Arc<Store>,
 }
 
 impl Session {
+    #[cfg(test)]
     fn new(config: PipelineConfig, options: CoreOptions) -> Self {
-        Self::restore(
+        let store = Store::open(std::path::Path::new(&options.runtime_dir))
+            .expect("open local session database");
+        Self::new_with_store(config, options, store)
+    }
+
+    fn new_with_store(config: PipelineConfig, options: CoreOptions, store: Arc<Store>) -> Self {
+        Self::restore_with_store(
             StoredSession {
                 id: Uuid::new_v4(),
                 config,
@@ -327,10 +326,18 @@ impl Session {
                 },
             },
             options,
+            store,
         )
     }
 
+    #[cfg(test)]
     fn restore(stored: StoredSession, options: CoreOptions) -> Self {
+        let store = Store::open(std::path::Path::new(&options.runtime_dir))
+            .expect("open local session database");
+        Self::restore_with_store(stored, options, store)
+    }
+
+    fn restore_with_store(stored: StoredSession, options: CoreOptions, store: Arc<Store>) -> Self {
         let (events, _) = broadcast::channel(512);
         let audio_duration_us = stored.metadata.audio_duration_us;
         Self {
@@ -351,9 +358,11 @@ impl Session {
             runtime: Mutex::new(None),
             lifecycle: Lifecycle::new(),
             subtitles: Mutex::new(SubtitleAssembler::default()),
+            subtitle_writes: Mutex::new(()),
             history: Mutex::new(VecDeque::new()),
             events,
             options,
+            store,
         }
     }
 
@@ -661,6 +670,7 @@ impl Session {
             task.abort();
             let _ = task.await;
         }
+        let first_speech_token = self.store.next_speech_token(self.id).await?;
         let (output_sender, output_receiver) = mpsc::channel(256);
         let mut runtime_guard = self.runtime.lock().await;
         let runtime = runtime_guard
@@ -695,6 +705,7 @@ impl Session {
                     config.latency_mode,
                     self.id,
                     epoch,
+                    first_speech_token,
                     output_sender,
                 ),
             )
@@ -763,7 +774,7 @@ impl Session {
             metrics.completed_duration_us = 0;
             metrics.model_backlog_us = 0;
         }
-        self.persist().await;
+        self.persist().await?;
         if operation.is_cancelled() {
             return Err(CoreError::InvalidState(
                 "capture start was cancelled before commit".into(),
@@ -875,6 +886,9 @@ impl Session {
                 Err(_) => cleanup_error = Some("output stop timed out".into()),
             }
         }
+        if let Err(error) = self.store.recover_speech(self.id).await {
+            cleanup_error = Some(error.to_string());
+        }
         self.playback.lock().await.clear();
         self.pending_speech.lock().await.clear();
         {
@@ -893,7 +907,7 @@ impl Session {
                 metadata.ended_at_ms = Some(now_ms());
             }
         }
-        self.persist().await;
+        self.persist().await?;
         if let Some(message) = cleanup_error {
             self.fault("resource_stop", message.clone(), true).await;
             return Err(CoreError::Output(message));
@@ -935,7 +949,7 @@ impl Session {
             }
         }
         if matches!(state, SessionState::Running | SessionState::Paused) {
-            self.persist().await;
+            self.persist().await?;
         }
         self.set_state(SessionState::Stopping, None).await;
         self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -974,6 +988,9 @@ impl Session {
                     Err(_) => cleanup_error = Some("translator stop timed out".into()),
                 }
             }
+        }
+        if let Err(error) = self.store.recover_speech(self.id).await {
+            cleanup_error = Some(error.to_string());
         }
         self.playback.lock().await.clear();
         self.pending_speech.lock().await.clear();
@@ -1027,7 +1044,7 @@ impl Session {
             config.source = source.clone();
             config.mute_original = mute_original;
         }
-        self.persist().await;
+        self.persist().await?;
         if state != SessionState::Running {
             return Ok(());
         }
@@ -1142,6 +1159,10 @@ impl Session {
             if let Some(output) = old_output.as_mut() {
                 let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
             }
+            if let Err(error) = self.store.recover_speech(self.id).await {
+                self.fault("speech_storage", error.to_string(), true).await;
+                return Err(error);
+            }
 
             self.playback.lock().await.clear();
             {
@@ -1150,6 +1171,7 @@ impl Session {
                 metrics.tts_queue_depth = 0;
             }
 
+            let first_speech_token = self.store.next_speech_token(self.id).await?;
             let (output_sender, output_receiver) = mpsc::channel(256);
             let mut output = match operation
                 .run_with_timeout(
@@ -1160,6 +1182,7 @@ impl Session {
                         config.latency_mode,
                         self.id,
                         epoch,
+                        first_speech_token,
                         output_sender,
                     ),
                 )
@@ -1255,7 +1278,7 @@ impl Session {
             .join(format!("{}.json", self.id))
     }
 
-    async fn persist(&self) {
+    async fn persist(&self) -> Result<()> {
         let audio_duration_us = self.metrics.lock().await.captured_duration_us;
         self.metadata.lock().await.audio_duration_us = audio_duration_us;
         let stored = StoredSession {
@@ -1263,19 +1286,7 @@ impl Session {
             config: self.config.read().await.clone(),
             metadata: self.metadata.lock().await.clone(),
         };
-        let result = async {
-            let path = self.manifest_path();
-            tokio::fs::create_dir_all(path.parent().expect("session directory")).await?;
-            let temporary = path.with_extension("json.tmp");
-            let contents = serde_json::to_vec_pretty(&stored)?;
-            tokio::fs::write(&temporary, contents).await?;
-            tokio::fs::rename(temporary, path).await?;
-            Ok::<(), Box<dyn std::error::Error>>(())
-        }
-        .await;
-        if let Err(error) = result {
-            tracing::warn!(session_id = %self.id, "failed to persist session: {error}");
-        }
+        self.store.save_session(stored).await
     }
 
     pub async fn rename(&self, title: String) -> Result<()> {
@@ -1286,7 +1297,7 @@ impl Session {
             ));
         }
         self.metadata.lock().await.title = title.to_string();
-        self.persist().await;
+        self.persist().await?;
         self.emit(SessionEventKind::State {
             state: *self.state.lock().await,
             message: Some("session renamed".into()),
@@ -1306,21 +1317,25 @@ impl Session {
             PipelineConfig {
                 output: OutputConfig::MacosSystem { cache_dir, .. },
                 ..
-            } => PathBuf::from(cache_dir),
-            _ => return Ok(()),
+            } => Some(PathBuf::from(cache_dir)),
+            _ => None,
         };
-        let mut entries = match tokio::fs::read_dir(cache).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        let marker = self.id.to_string();
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_name().to_string_lossy().contains(&marker) {
-                let _ = tokio::fs::remove_file(entry.path()).await;
+        if let Some(cache) = cache {
+            let mut entries = match tokio::fs::read_dir(cache).await {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return self.store.delete_session(self.id).await;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let marker = self.id.to_string();
+            while let Some(entry) = entries.next_entry().await? {
+                if entry.file_name().to_string_lossy().contains(&marker) {
+                    let _ = tokio::fs::remove_file(entry.path()).await;
+                }
             }
         }
-        Ok(())
+        self.store.delete_session(self.id).await
     }
 
     fn history_path(&self) -> PathBuf {
@@ -1329,30 +1344,44 @@ impl Session {
             .join(format!("{}.jsonl", self.id))
     }
 
-    pub async fn history(&self) -> Vec<SubtitleCue> {
-        if let Ok(contents) = tokio::fs::read_to_string(self.history_path()).await
-            && let Some(history) = fold_subtitle_history(&contents)
-        {
-            return history;
-        }
-        self.history.lock().await.iter().cloned().collect()
+    pub async fn history(&self) -> Result<Vec<SubtitleCue>> {
+        self.store.history(self.id).await
     }
 
-    pub async fn clear_history(&self) {
+    pub async fn clear_history(&self) -> Result<()> {
+        let _write = self.subtitle_writes.lock().await;
+        self.store.clear_history(self.id).await?;
         self.history.lock().await.clear();
         *self.subtitles.lock().await = SubtitleAssembler::default();
-        if let Err(error) = tokio::fs::remove_file(self.history_path()).await
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            self.emit(SessionEventKind::Warning {
-                code: "subtitle_storage".into(),
-                message: format!("failed to remove subtitle history: {error}"),
-            });
-        }
         self.emit(SessionEventKind::HistoryCleared);
+        Ok(())
     }
 
+    #[cfg(test)]
     async fn record_subtitle(&self, cue: SubtitleCue) {
+        let _write = self.subtitle_writes.lock().await;
+        self.record_subtitle_locked(cue).await;
+    }
+
+    async fn record_subtitle_locked(&self, cue: SubtitleCue) {
+        if let Err(error) = self.persist().await {
+            self.emit(SessionEventKind::Warning {
+                code: "subtitle_storage".into(),
+                message: format!("subtitle revision was not published: {error}"),
+            });
+            return;
+        }
+        match self.store.record_cue(self.id, cue.clone()).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(error) => {
+                self.emit(SessionEventKind::Warning {
+                    code: "subtitle_storage".into(),
+                    message: format!("subtitle revision was not published: {error}"),
+                });
+                return;
+            }
+        }
         {
             let mut history = self.history.lock().await;
             if let Some(existing) = history.iter_mut().find(|item| item.cue_id == cue.cue_id) {
@@ -1364,36 +1393,30 @@ impl Session {
                 }
             }
         }
-        let persisted = async {
-            let path = self.history_path();
-            tokio::fs::create_dir_all(path.parent().expect("subtitle directory"))
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut file = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await
-                .map_err(|error| error.to_string())?;
-            let line = serde_json::to_string(&cue).map_err(|error| error.to_string())?;
-            file.write_all(format!("{line}\n").as_bytes())
-                .await
-                .map_err(|error| error.to_string())
-        }
-        .await;
-        if let Err(message) = persisted {
-            self.emit(SessionEventKind::Warning {
-                code: "subtitle_storage".into(),
-                message: format!("subtitle history is memory-only: {message}"),
-            });
-        }
         self.emit(SessionEventKind::Subtitle(cue));
     }
 
+    pub async fn export_wav(&self) -> Result<PathBuf> {
+        let cache_dir = match &*self.config.read().await {
+            PipelineConfig {
+                output: OutputConfig::MacosSystem { cache_dir, .. },
+                ..
+            } => PathBuf::from(cache_dir),
+            _ => {
+                return Err(CoreError::InvalidConfig(
+                    "mock output does not create audio files".into(),
+                ));
+            }
+        };
+        let segments = self.store.speech_segments(self.id).await?;
+        crate::export::export_wav(self.id, segments, cache_dir).await
+    }
+
     async fn flush_subtitle(&self) {
+        let _write = self.subtitle_writes.lock().await;
         let cue = self.subtitles.lock().await.flush();
         if let Some(cue) = cue {
-            self.record_subtitle(cue).await;
+            self.record_subtitle_locked(cue).await;
         }
     }
 
@@ -1449,7 +1472,7 @@ impl Session {
                 },
             )
             .await?;
-        self.persist().await;
+        self.persist().await?;
         self.emit(SessionEventKind::State {
             state,
             message: Some("translation direction and language context updated".into()),
@@ -1475,7 +1498,7 @@ impl Session {
                 Ok(())
             })
             .await?;
-        self.persist().await;
+        self.persist().await?;
         self.emit(SessionEventKind::State {
             state,
             message: Some("voice policy updated".into()),
@@ -1498,7 +1521,7 @@ impl Session {
         *self.config.write().await = config;
         *self.metrics.lock().await = SessionMetrics::default();
         *self.last_error.lock().await = None;
-        self.persist().await;
+        self.persist().await?;
         self.emit(SessionEventKind::State {
             state: SessionState::Idle,
             message: Some("configuration updated".into()),
@@ -1512,21 +1535,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-fn fold_subtitle_history(contents: &str) -> Option<Vec<SubtitleCue>> {
-    let mut history = Vec::<SubtitleCue>::new();
-    let mut positions = HashMap::<String, usize>::new();
-    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-        let cue = serde_json::from_str::<SubtitleCue>(line).ok()?;
-        if let Some(position) = positions.get(&cue.cue_id).copied() {
-            history[position] = cue;
-        } else {
-            positions.insert(cue.cue_id.clone(), history.len());
-            history.push(cue);
-        }
-    }
-    Some(history)
 }
 
 async fn forward_translator(
@@ -1578,8 +1586,11 @@ async fn forward_translator(
                     .map(|timestamp| timestamp.saturating_add(timeline_offset_ns));
                 session.metrics.lock().await.translations += 1;
                 session.emit(SessionEventKind::Translation(event.clone()));
-                let cue = session.subtitles.lock().await.push(&event);
-                session.record_subtitle(cue).await;
+                {
+                    let _write = session.subtitle_writes.lock().await;
+                    let cue = session.subtitles.lock().await.push(&event);
+                    session.record_subtitle_locked(cue).await;
+                }
                 if event.speakable {
                     let mut runtime = session.runtime.lock().await;
                     if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
@@ -1685,6 +1696,28 @@ async fn forward_output(
         match signal {
             OutputSignal::Playback(event) => {
                 if event.token != 0 {
+                    let cache_dir = match &*session.config.read().await {
+                        PipelineConfig {
+                            output: OutputConfig::MacosSystem { cache_dir, .. },
+                            ..
+                        } => PathBuf::from(cache_dir),
+                        _ => PathBuf::from(&session.options.runtime_dir).join("cache"),
+                    };
+                    match session
+                        .store
+                        .record_playback(session.id, cache_dir, event.clone())
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(error) => {
+                            session.emit(SessionEventKind::Warning {
+                                code: "speech_storage".into(),
+                                message: format!("playback state was not persisted: {error}"),
+                            });
+                            continue;
+                        }
+                    }
                     let snapshot = {
                         let update = session
                             .playback
@@ -2177,7 +2210,7 @@ mod tests {
         let snapshot = session.snapshot().await;
         assert!(snapshot.metrics.translations >= 1);
         assert!(snapshot.epoch > 1);
-        let history = session.history().await;
+        let history = session.history().await.unwrap();
         assert!(history.iter().all(|cue| cue.is_final));
         assert!(history.windows(2).all(|pair| {
             pair[0].source_start_ns <= pair[1].source_start_ns
@@ -2451,11 +2484,11 @@ mod tests {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
         });
-        let first = manager.create(PipelineConfig::default()).await;
+        let first = manager.create(PipelineConfig::default()).await.unwrap();
         manager.prepare(first.id).await.unwrap();
         wait_for_state(&first, SessionState::Ready).await;
         *first.state.lock().await = SessionState::Configuring;
-        let second = manager.create(PipelineConfig::default()).await;
+        let second = manager.create(PipelineConfig::default()).await.unwrap();
         manager.prepare(second.id).await.unwrap();
         wait_for_state(&second, SessionState::Ready).await;
         assert_eq!(first.snapshot().await.state, SessionState::Idle);
@@ -2593,13 +2626,16 @@ mod tests {
         assert_eq!(snapshot.metrics.dropped_duration_us, 20_000_000);
         assert_eq!(snapshot.metrics.sent_duration_us, 800_000);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while session.history().await.is_empty() {
+            while session.history().await.unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(session.history().await[0].source_start_ns, 20_000_000_000);
+        assert_eq!(
+            session.history().await.unwrap()[0].source_start_ns,
+            20_000_000_000
+        );
         session.stop_model().await.unwrap();
     }
 
@@ -2610,8 +2646,8 @@ mod tests {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
         }));
-        let first = manager.create(PipelineConfig::default()).await;
-        let second = manager.create(PipelineConfig::default()).await;
+        let first = manager.create(PipelineConfig::default()).await.unwrap();
+        let second = manager.create(PipelineConfig::default()).await.unwrap();
         let mut prepares = tokio::task::JoinSet::new();
         for id in [first.id, second.id] {
             let manager = Arc::clone(&manager);
@@ -2688,6 +2724,7 @@ mod tests {
                 if session
                     .history()
                     .await
+                    .unwrap()
                     .iter()
                     .any(|cue| cue.segment_ids.iter().any(|id| id.ends_with("fresh-run")))
                 {
@@ -2702,6 +2739,7 @@ mod tests {
             session
                 .history()
                 .await
+                .unwrap()
                 .iter()
                 .all(|cue| { cue.segment_ids.iter().all(|id| !id.ends_with("stale-run")) })
         );
@@ -2758,13 +2796,13 @@ mod tests {
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while session.history().await.len() < 2 {
+            while session.history().await.unwrap().len() < 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        let history = session.history().await;
+        let history = session.history().await.unwrap();
         assert_eq!(history[0].source_start_ns, 10_000_000_000);
         assert_eq!(history[1].source_start_ns, 20_000_000_000);
         assert!(history[0].segment_ids[0].contains("source-1-"));
@@ -2845,6 +2883,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_playback_is_not_broadcast_and_stop_settles_pending_speech() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.persist().await.unwrap();
+        let (sender, receiver) = mpsc::channel(512);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(forward_output(
+            Arc::downgrade(&session),
+            receiver,
+            cancellation.clone(),
+        ));
+        let mut events = session.subscribe();
+        let playback = |token, event_type| PlaybackEvent {
+            event_type,
+            segment_id: format!("segment-{token}"),
+            token,
+            queue_duration_us: 0,
+            actual_start_mono_ns: None,
+            source_end_ns: None,
+        };
+        for token in 1..=70 {
+            sender
+                .send(OutputSignal::Playback(playback(
+                    token,
+                    PlaybackEventType::Finished,
+                )))
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.snapshot().await.metrics.playback_finished < 70 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        while events.try_recv().is_ok() {}
+        sender
+            .send(OutputSignal::Playback(playback(
+                1,
+                PlaybackEventType::Started,
+            )))
+            .await
+            .unwrap();
+        sender
+            .send(OutputSignal::Playback(playback(
+                1,
+                PlaybackEventType::Queued,
+            )))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.snapshot().await.metrics.playback_pending, 0);
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event.kind, SessionEventKind::Playback(_)));
+        }
+
+        sender
+            .send(OutputSignal::Playback(playback(
+                71,
+                PlaybackEventType::Queued,
+            )))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.snapshot().await.metrics.playback_pending != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        session.stop_model().await.unwrap();
+        let speech = session.store.speech_segments(session.id).await.unwrap();
+        assert_eq!(speech.last().unwrap().token, 71);
+        assert_eq!(speech.last().unwrap().status, "cancelled");
+        cancellation.cancel();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn clear_history_waits_for_the_subtitle_write_critical_section() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.persist().await.unwrap();
+        let write = session.subtitle_writes.lock().await;
+        let clearing = {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move { session.clear_history().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!clearing.is_finished());
+        drop(write);
+        tokio::time::timeout(Duration::from_secs(1), clearing)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(session.history().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn restored_history_and_new_uuid_cues_coexist() {
         let root = tempfile::tempdir().unwrap();
         let options = CoreOptions {
@@ -2877,7 +3028,7 @@ mod tests {
         assert_ne!(cue.cue_id, "cue-0");
         assert_eq!(cue.cue_id.len(), 36);
         restored.record_subtitle(cue).await;
-        let history = restored.history().await;
+        let history = restored.history().await.unwrap();
         assert_eq!(history.len(), 2);
         assert!(history.iter().any(|cue| cue.cue_id == "cue-0"));
     }
@@ -2948,9 +3099,19 @@ mod tests {
         let snapshot = session.snapshot().await;
         assert_eq!(snapshot.metrics.sent_duration_us, 100_000);
         assert_eq!(snapshot.metrics.playback_pending, 0);
-        assert_eq!(session.history().await[0].source_end_ns, 100_000_000);
+        assert_eq!(
+            session.history().await.unwrap()[0].source_end_ns,
+            100_000_000
+        );
         assert!(snapshot.metrics.playback_finished >= 1);
-        assert!(session.history().await.iter().all(|cue| cue.is_final));
+        assert!(
+            session
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .all(|cue| cue.is_final)
+        );
         session.stop_model().await.unwrap();
     }
 
@@ -2985,11 +3146,11 @@ mod tests {
             audio_host: "unused".into(),
             runtime_dir: root.to_string_lossy().into_owned(),
         });
-        let first = manager.create(PipelineConfig::default()).await;
+        let first = manager.create(PipelineConfig::default()).await.unwrap();
         manager.prepare(first.id).await.unwrap();
         wait_for_state(&first, SessionState::Ready).await;
 
-        let second = manager.create(PipelineConfig::default()).await;
+        let second = manager.create(PipelineConfig::default()).await.unwrap();
         manager.prepare(second.id).await.unwrap();
         wait_for_state(&second, SessionState::Ready).await;
         assert_eq!(first.snapshot().await.state, SessionState::Idle);
@@ -3051,15 +3212,16 @@ mod tests {
         assert_eq!(cached.back().unwrap().cue_id, "cue-599");
         drop(cached);
 
-        let history = session.history().await;
+        let history = session.history().await.unwrap();
         assert_eq!(history.len(), 600);
         assert_eq!(history.first().unwrap().cue_id, "cue-0");
         assert_eq!(history.last().unwrap().cue_id, "cue-599");
-        assert!(session.history_path().exists());
+        assert!(root.join("echonote.db").exists());
 
-        session.clear_history().await;
-        assert!(session.history().await.is_empty());
-        assert!(!session.history_path().exists());
+        session.clear_history().await.unwrap();
+        assert!(session.history().await.unwrap().is_empty());
+        assert!(root.join("echonote.db").exists());
+        assert_eq!(session.store.history(session.id).await.unwrap(), Vec::new());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }
 }

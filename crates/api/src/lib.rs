@@ -225,7 +225,7 @@ pub struct TranslationEvent {
     pub speakable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubtitleCue {
     pub cue_id: String,
     pub revision: u64,

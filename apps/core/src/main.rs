@@ -271,7 +271,7 @@ async fn create_session(
     State(state): State<AppState>,
     Json(config): Json<PipelineConfig>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
-    let session = state.manager.create(config).await;
+    let session = state.manager.create(config).await?;
     Ok(Json(session.snapshot().await))
 }
 
@@ -429,7 +429,7 @@ async fn history(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<SubtitleCue>>, ApiError> {
-    Ok(Json(state.manager.get(id).await?.history().await))
+    Ok(Json(state.manager.get(id).await?.history().await?))
 }
 
 async fn clear_history(
@@ -437,7 +437,7 @@ async fn clear_history(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<SubtitleCue>>, ApiError> {
     let session = state.manager.get(id).await?;
-    session.clear_history().await;
+    session.clear_history().await?;
     Ok(Json(Vec::new()))
 }
 
@@ -445,7 +445,7 @@ async fn export_srt(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let cues = state.manager.get(id).await?.history().await;
+    let cues = state.manager.get(id).await?.history().await?;
     Ok(download_response(
         "simulmt-subtitles.srt",
         "application/x-subrip; charset=utf-8",
@@ -457,7 +457,7 @@ async fn export_vtt(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let cues = state.manager.get(id).await?.history().await;
+    let cues = state.manager.get(id).await?.history().await?;
     Ok(download_response(
         "simulmt-subtitles.vtt",
         "text/vtt; charset=utf-8",
@@ -469,51 +469,7 @@ async fn export_wav(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let snapshot = state.manager.get(id).await?.snapshot().await;
-    let cache_dir = match snapshot.config.output {
-        OutputConfig::MacosSystem { cache_dir, .. } => PathBuf::from(cache_dir),
-        OutputConfig::Mock => {
-            return Err(
-                CoreError::InvalidConfig("mock output does not create audio files".into()).into(),
-            );
-        }
-    };
-    let mut paths = Vec::new();
-    for token in 1_u64.. {
-        let path = cache_dir.join(format!("speech-{id}-{token}.wav"));
-        if !path.exists() {
-            break;
-        }
-        paths.push(path);
-    }
-    if paths.is_empty() {
-        return Err(CoreError::InvalidConfig(
-            "no synthesized translation audio is available yet".into(),
-        )
-        .into());
-    }
-    let first =
-        hound::WavReader::open(&paths[0]).map_err(|error| CoreError::Output(error.to_string()))?;
-    let spec = first.spec();
-    drop(first);
-    let export_path = cache_dir.join(format!("simulmt-translation-{id}.wav"));
-    let mut writer = hound::WavWriter::create(&export_path, spec)
-        .map_err(|error| CoreError::Output(error.to_string()))?;
-    for path in paths {
-        let mut reader =
-            hound::WavReader::open(path).map_err(|error| CoreError::Output(error.to_string()))?;
-        if reader.spec() != spec {
-            return Err(CoreError::Output("inconsistent synthesized WAV formats".into()).into());
-        }
-        for sample in reader.samples::<i16>() {
-            writer
-                .write_sample(sample.map_err(|error| CoreError::Output(error.to_string()))?)
-                .map_err(|error| CoreError::Output(error.to_string()))?;
-        }
-    }
-    writer
-        .finalize()
-        .map_err(|error| CoreError::Output(error.to_string()))?;
+    let export_path = state.manager.get(id).await?.export_wav().await?;
     let file = tokio::fs::File::open(export_path)
         .await
         .map_err(|error| CoreError::Output(error.to_string()))?;
