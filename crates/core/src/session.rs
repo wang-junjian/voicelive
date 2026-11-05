@@ -30,6 +30,7 @@ pub struct DeploymentConfig {
 pub struct CoreOptions {
     pub audio_host: String,
     pub runtime_dir: String,
+    pub instance_id: Uuid,
     pub deployment: DeploymentConfig,
 }
 
@@ -47,6 +48,10 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    pub fn instance_id(&self) -> Uuid {
+        self.options.instance_id
+    }
+
     pub fn new(options: CoreOptions) -> Self {
         let store = Store::open(std::path::Path::new(&options.runtime_dir))
             .expect("open local session database");
@@ -315,6 +320,8 @@ pub struct Session {
     subtitle_writes: Mutex<()>,
     history: Mutex<VecDeque<SubtitleCue>>,
     events: broadcast::Sender<SessionEvent>,
+    event_publication: Mutex<()>,
+    event_sequence: AtomicU64,
     options: CoreOptions,
     store: Arc<Store>,
 }
@@ -376,6 +383,8 @@ impl Session {
             subtitle_writes: Mutex::new(()),
             history: Mutex::new(VecDeque::new()),
             events,
+            event_publication: Mutex::new(()),
+            event_sequence: AtomicU64::new(0),
             options,
             store,
         }
@@ -392,11 +401,33 @@ impl Session {
         self.events.subscribe()
     }
 
+    /// Freezes event publication while the authoritative snapshot and complete
+    /// history are read. The receiver starts exactly after the baseline cursor.
+    pub async fn subscribe_baseline(
+        &self,
+    ) -> Result<(SessionBaseline, broadcast::Receiver<SessionEvent>)> {
+        let _publication = self.event_publication.lock().await;
+        let sequence = self.event_sequence.load(Ordering::Acquire);
+        let snapshot = self.snapshot().await;
+        let history = self.history().await?;
+        let baseline = SessionBaseline {
+            api_version: API_VERSION.into(),
+            instance_id: self.options.instance_id,
+            session_id: self.id,
+            sequence,
+            snapshot,
+            history,
+        };
+        Ok((baseline, self.events.subscribe()))
+    }
+
     pub async fn snapshot(&self) -> SessionSnapshot {
         let metadata = self.metadata.lock().await.clone();
         SessionSnapshot {
             api_version: API_VERSION.into(),
+            instance_id: self.options.instance_id,
             session_id: self.id,
+            event_sequence: self.event_sequence.load(Ordering::Acquire),
             epoch: self.epoch.load(Ordering::Relaxed),
             state: *self.state.lock().await,
             title: metadata.title,
@@ -409,23 +440,27 @@ impl Session {
         }
     }
 
-    fn event(&self, kind: SessionEventKind) -> SessionEvent {
+    fn event(&self, kind: SessionEventKind, sequence: u64) -> SessionEvent {
         SessionEvent {
             api_version: API_VERSION.into(),
+            instance_id: self.options.instance_id,
             session_id: self.id,
+            sequence,
             epoch: self.epoch.load(Ordering::Relaxed),
             emitted_mono_ns: monotonic_ns(),
             kind,
         }
     }
 
-    fn emit(&self, kind: SessionEventKind) {
-        let _ = self.events.send(self.event(kind));
+    async fn emit(&self, kind: SessionEventKind) {
+        let _publication = self.event_publication.lock().await;
+        let sequence = self.event_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.events.send(self.event(kind, sequence));
     }
 
     async fn set_state(&self, state: SessionState, message: Option<String>) {
         *self.state.lock().await = state;
-        self.emit(SessionEventKind::State { state, message });
+        self.emit(SessionEventKind::State { state, message }).await;
     }
 
     async fn fault(self: &Arc<Self>, code: &str, message: String, fatal: bool) {
@@ -440,7 +475,8 @@ impl Session {
             code: code.into(),
             message,
             fatal,
-        });
+        })
+        .await;
         if fatal
             && !matches!(
                 previous_state,
@@ -1035,7 +1071,8 @@ impl Session {
                 code: "resource_stop".into(),
                 message: message.clone(),
                 fatal: true,
-            });
+            })
+            .await;
             self.set_state(
                 SessionState::Faulted,
                 Some("resource cleanup failed".into()),
@@ -1083,7 +1120,8 @@ impl Session {
         self.emit(SessionEventKind::State {
             state: SessionState::Running,
             message: Some("audio source switched in a new capture run".into()),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -1304,7 +1342,8 @@ impl Session {
             self.emit(SessionEventKind::Warning {
                 code: "output_recovered".into(),
                 message: "audio input and output recovered; translator kept warm".into(),
-            });
+            })
+            .await;
             Ok(())
         })
     }
@@ -1338,7 +1377,8 @@ impl Session {
         self.emit(SessionEventKind::State {
             state: *self.state.lock().await,
             message: Some("session renamed".into()),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -1382,7 +1422,7 @@ impl Session {
         self.store.clear_history(self.id).await?;
         self.history.lock().await.clear();
         *self.subtitles.lock().await = SubtitleAssembler::default();
-        self.emit(SessionEventKind::HistoryCleared);
+        self.emit(SessionEventKind::HistoryCleared).await;
         Ok(())
     }
 
@@ -1397,7 +1437,8 @@ impl Session {
             self.emit(SessionEventKind::Warning {
                 code: "subtitle_storage".into(),
                 message: format!("subtitle revision was not published: {error}"),
-            });
+            })
+            .await;
             return;
         }
         match self.store.record_cue(self.id, cue.clone()).await {
@@ -1407,7 +1448,8 @@ impl Session {
                 self.emit(SessionEventKind::Warning {
                     code: "subtitle_storage".into(),
                     message: format!("subtitle revision was not published: {error}"),
-                });
+                })
+                .await;
                 return;
             }
         }
@@ -1422,7 +1464,7 @@ impl Session {
                 }
             }
         }
-        self.emit(SessionEventKind::Subtitle(cue));
+        self.emit(SessionEventKind::Subtitle(cue)).await;
     }
 
     pub async fn export_subtitles(&self, format: SubtitleExportFormat) -> Result<String> {
@@ -1513,7 +1555,8 @@ impl Session {
         self.emit(SessionEventKind::State {
             state,
             message: Some("translation direction and language context updated".into()),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -1539,7 +1582,8 @@ impl Session {
         self.emit(SessionEventKind::State {
             state,
             message: Some("voice policy updated".into()),
-        });
+        })
+        .await;
         Ok(())
     }
 
@@ -1562,7 +1606,8 @@ impl Session {
         self.emit(SessionEventKind::State {
             state: SessionState::Idle,
             message: Some("configuration updated".into()),
-        });
+        })
+        .await;
         Ok(())
     }
 }
@@ -1622,7 +1667,9 @@ async fn forward_translator(
                     .source_end_ns
                     .map(|timestamp| timestamp.saturating_add(timeline_offset_ns));
                 session.metrics.lock().await.translations += 1;
-                session.emit(SessionEventKind::Translation(event.clone()));
+                session
+                    .emit(SessionEventKind::Translation(event.clone()))
+                    .await;
                 {
                     let _write = session.subtitle_writes.lock().await;
                     let cue = session.subtitles.lock().await.push(&event);
@@ -1636,20 +1683,25 @@ async fn forward_translator(
                             result = output.submit(event) => result,
                         };
                         if let Err(error) = submitted {
-                            session.emit(SessionEventKind::Warning {
-                                code: "tts_queue".into(),
-                                message: error.to_string(),
-                            });
+                            session
+                                .emit(SessionEventKind::Warning {
+                                    code: "tts_queue".into(),
+                                    message: error.to_string(),
+                                })
+                                .await;
                         }
                     } else {
                         drop(runtime);
                         let mut pending = session.pending_speech.lock().await;
                         if pending.len() >= PENDING_SPEECH_LIMIT {
-                            session.emit(SessionEventKind::Warning {
-                                code: "tts_recovery_queue".into(),
-                                message: "dropped new speech because the recovery queue is full"
-                                    .into(),
-                            });
+                            session
+                                .emit(SessionEventKind::Warning {
+                                    code: "tts_recovery_queue".into(),
+                                    message:
+                                        "dropped new speech because the recovery queue is full"
+                                            .into(),
+                                })
+                                .await;
                         } else {
                             pending.push_back(event);
                         }
@@ -1668,7 +1720,7 @@ async fn forward_translator(
                     .saturating_sub(metrics.completed_duration_us);
                 let snapshot = metrics.clone();
                 drop(metrics);
-                session.emit(SessionEventKind::Metrics(snapshot));
+                session.emit(SessionEventKind::Metrics(snapshot)).await;
             }
             TranslatorSignal::ContextRotated => {
                 let snapshot = {
@@ -1676,7 +1728,7 @@ async fn forward_translator(
                     metrics.context_rotations += 1;
                     metrics.clone()
                 };
-                session.emit(SessionEventKind::Metrics(snapshot));
+                session.emit(SessionEventKind::Metrics(snapshot)).await;
             }
             TranslatorSignal::ModelRestarted => {
                 let snapshot = {
@@ -1684,7 +1736,7 @@ async fn forward_translator(
                     metrics.model_restarts += 1;
                     metrics.clone()
                 };
-                session.emit(SessionEventKind::Metrics(snapshot));
+                session.emit(SessionEventKind::Metrics(snapshot)).await;
             }
             TranslatorSignal::SourceReset {
                 epoch,
@@ -1703,16 +1755,18 @@ async fn forward_translator(
                     metrics.source_resets += 1;
                     metrics.clone()
                 };
-                session.emit(SessionEventKind::Metrics(snapshot));
+                session.emit(SessionEventKind::Metrics(snapshot)).await;
             }
             TranslatorSignal::StreamEnded(message) => {
                 session.recover_translator(message).await;
             }
             TranslatorSignal::Warning(message) => {
-                session.emit(SessionEventKind::Warning {
-                    code: "translator".into(),
-                    message,
-                });
+                session
+                    .emit(SessionEventKind::Warning {
+                        code: "translator".into(),
+                        message,
+                    })
+                    .await;
             }
         }
     }
@@ -1742,10 +1796,12 @@ async fn forward_output(
                         Ok(true) => {}
                         Ok(false) => continue,
                         Err(error) => {
-                            session.emit(SessionEventKind::Warning {
-                                code: "speech_storage".into(),
-                                message: format!("playback state was not persisted: {error}"),
-                            });
+                            session
+                                .emit(SessionEventKind::Warning {
+                                    code: "speech_storage".into(),
+                                    message: format!("playback state was not persisted: {error}"),
+                                })
+                                .await;
                             continue;
                         }
                     }
@@ -1786,8 +1842,8 @@ async fn forward_output(
                         }
                         metrics.clone()
                     };
-                    session.emit(SessionEventKind::Metrics(snapshot));
-                    session.emit(SessionEventKind::Playback(event));
+                    session.emit(SessionEventKind::Metrics(snapshot)).await;
+                    session.emit(SessionEventKind::Playback(event)).await;
                 }
             }
             OutputSignal::QueueDepth(depth) => {
@@ -1796,19 +1852,23 @@ async fn forward_output(
                     metrics.tts_queue_depth = depth;
                     metrics.clone()
                 };
-                session.emit(SessionEventKind::Metrics(snapshot));
+                session.emit(SessionEventKind::Metrics(snapshot)).await;
             }
             OutputSignal::Warning(message) => {
-                session.emit(SessionEventKind::Warning {
-                    code: "output".into(),
-                    message,
-                });
+                session
+                    .emit(SessionEventKind::Warning {
+                        code: "output".into(),
+                        message,
+                    })
+                    .await;
             }
             OutputSignal::Error(message) => {
-                session.emit(SessionEventKind::Warning {
-                    code: "output".into(),
-                    message,
-                });
+                session
+                    .emit(SessionEventKind::Warning {
+                        code: "output".into(),
+                        message,
+                    })
+                    .await;
             }
             OutputSignal::DrainBarrier(ack) => {
                 let _ = ack.send(());
@@ -1887,10 +1947,12 @@ async fn forward_source(
                 metrics.dropped_duration_us += duration_us as u64;
             }
             SourceEvent::Ended => {
-                session.emit(SessionEventKind::Warning {
-                    code: "source_ended".into(),
-                    message: "audio source ended; draining translation and playback".into(),
-                });
+                session
+                    .emit(SessionEventKind::Warning {
+                        code: "source_ended".into(),
+                        message: "audio source ended; draining translation and playback".into(),
+                    })
+                    .await;
                 if let Some(block) = chunker.finish()
                     && let Err(error) =
                         forward_model_block(&session, block, &queue_policy, &cancellation).await
@@ -1933,10 +1995,12 @@ async fn forward_source(
                             result = output.finish() => result,
                         };
                         if let Err(error) = finished {
-                            session.emit(SessionEventKind::Warning {
-                                code: "tts_finish".into(),
-                                message: error.to_string(),
-                            });
+                            session
+                                .emit(SessionEventKind::Warning {
+                                    code: "tts_finish".into(),
+                                    message: error.to_string(),
+                                })
+                                .await;
                         }
                     }
                     drop(runtime);
@@ -1963,10 +2027,12 @@ async fn forward_source(
                 break;
             }
             SourceEvent::Warning(message) => {
-                session.emit(SessionEventKind::Warning {
-                    code: "source_recovery".into(),
-                    message,
-                });
+                session
+                    .emit(SessionEventKind::Warning {
+                        code: "source_recovery".into(),
+                        message,
+                    })
+                    .await;
             }
             SourceEvent::Error(message) => {
                 session.fault("source_lost", message, true).await;
@@ -2028,10 +2094,12 @@ async fn forward_model_block(
                 metrics.dropped_frames += 1;
                 metrics.dropped_duration_us += block.duration_us as u64;
                 drop(metrics);
-                session.emit(SessionEventKind::Warning {
-                    code: "backlog_overflow".into(),
-                    message: format!("dropped one audio block at {backlog} us backlog"),
-                });
+                session
+                    .emit(SessionEventKind::Warning {
+                        code: "backlog_overflow".into(),
+                        message: format!("dropped one audio block at {backlog} us backlog"),
+                    })
+                    .await;
                 return Ok(());
             }
         }
@@ -2120,12 +2188,14 @@ async fn reset_stale_backlog(
             metrics.tts_queue_depth = 0;
         }
     }
-    session.emit(SessionEventKind::Warning {
-        code: "stale_backlog_dropped".into(),
-        message: format!(
-            "dropped {backlog_us} us of stale model backlog and resumed at the live edge"
-        ),
-    });
+    session
+        .emit(SessionEventKind::Warning {
+            code: "stale_backlog_dropped".into(),
+            message: format!(
+                "dropped {backlog_us} us of stale model backlog and resumed at the live edge"
+            ),
+        })
+        .await;
     Ok(())
 }
 
@@ -2214,12 +2284,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn baseline_and_events_share_one_monotonic_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let instance_id = Uuid::new_v4();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id,
+                deployment: DeploymentConfig::default(),
+            },
+        ));
+        let (baseline, mut events) = session.subscribe_baseline().await.unwrap();
+        assert_eq!(baseline.sequence, 0);
+        assert_eq!(baseline.snapshot.event_sequence, 0);
+        assert_eq!(baseline.instance_id, instance_id);
+        assert!(baseline.history.is_empty());
+
+        session.rename("contract".into()).await.unwrap();
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.sequence, baseline.sequence + 1);
+        assert_eq!(event.instance_id, instance_id);
+        assert_eq!(event.session_id, session.id);
+        let (second, _) = session.subscribe_baseline().await.unwrap();
+        assert_eq!(second.sequence, event.sequence);
+        assert_eq!(second.snapshot.title, "contract");
+        assert_eq!(second.snapshot.event_sequence, second.sequence);
+    }
+
+    #[tokio::test]
+    async fn lagged_receiver_can_recover_from_a_complete_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::new_v4(),
+                deployment: DeploymentConfig::default(),
+            },
+        );
+        let (_, mut events) = session.subscribe_baseline().await.unwrap();
+        for _ in 0..600 {
+            session
+                .emit(SessionEventKind::Warning {
+                    code: "test".into(),
+                    message: "fill the bounded event buffer".into(),
+                })
+                .await;
+        }
+        assert!(matches!(
+            events.recv().await,
+            Err(broadcast::error::RecvError::Lagged(_))
+        ));
+        let (baseline, _) = session.subscribe_baseline().await.unwrap();
+        assert_eq!(baseline.sequence, 600);
+        assert_eq!(baseline.snapshot.event_sequence, 600);
+    }
+
+    #[tokio::test]
     async fn mock_session_covers_complete_lifecycle() {
         let session = Session::new(
             PipelineConfig::default(),
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: "/tmp".into(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         );
@@ -2287,6 +2418,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2370,6 +2502,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2438,6 +2571,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2472,6 +2606,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2495,6 +2630,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2520,6 +2656,7 @@ mod tests {
         let manager = SessionManager::new(CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
+            instance_id: Uuid::nil(),
             deployment: DeploymentConfig::default(),
         });
         let first = manager.create(PipelineConfig::default()).await.unwrap();
@@ -2582,6 +2719,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2622,6 +2760,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2685,6 +2824,7 @@ mod tests {
         let manager = Arc::new(SessionManager::new(CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
+            instance_id: Uuid::nil(),
             deployment: DeploymentConfig::default(),
         }));
         let first = manager.create(PipelineConfig::default()).await.unwrap();
@@ -2724,6 +2864,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2798,6 +2939,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2865,6 +3007,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -2934,6 +3077,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -3021,6 +3165,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -3047,6 +3192,7 @@ mod tests {
         let options = CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
+            instance_id: Uuid::nil(),
             deployment: DeploymentConfig::default(),
         };
         let session = Session::new(PipelineConfig::default(), options.clone());
@@ -3110,6 +3256,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig {
                     model_executable: executable,
                     model_path: model,
@@ -3140,6 +3287,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         ));
@@ -3196,6 +3344,7 @@ mod tests {
         let manager = SessionManager::new(CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.to_string_lossy().into_owned(),
+            instance_id: Uuid::nil(),
             deployment: DeploymentConfig::default(),
         });
         let first = manager.create(PipelineConfig::default()).await.unwrap();
@@ -3242,6 +3391,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
                 deployment: DeploymentConfig::default(),
             },
         );

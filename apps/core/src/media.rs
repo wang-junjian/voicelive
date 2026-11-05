@@ -3,6 +3,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
 use futures_util::StreamExt;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -66,7 +67,7 @@ fn environment_u64(name: &str, default: u64) -> Result<u64, String> {
     })
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 pub(crate) struct ImportedMedia {
     pub name: String,
     pub path: String,

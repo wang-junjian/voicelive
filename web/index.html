@@ -72,7 +72,58 @@ function renderPanel(){const session=active();if(!session)return;const model=mod
 function openPanel(mode){panelOpen=true;panelMode=mode;renderPanel();$("infoPanel").classList.add("open");$("infoPanel").setAttribute("aria-hidden","false");$("panelBackdrop").classList.add("visible")}
 function closePanel(){panelOpen=false;$("infoPanel").classList.remove("open");$("infoPanel").setAttribute("aria-hidden","true");$("panelBackdrop").classList.remove("visible")}
 async function run(work){if(busy)return;busy=true;renderTransport();try{await work()}catch(error){toast(error.message,true)}finally{busy=false;renderAll();if(panelOpen)renderPanel()}}
-function connect(){if(ws)ws.close();if(!activeId)return;const protocol=location.protocol==="https:"?"wss":"ws";ws=new WebSocket(`${protocol}://${location.host}/api/sessions/${activeId}/ws`);ws.onopen=()=>ws.send(JSON.stringify({type:"authenticate",token:authToken}));ws.onmessage=message=>{const event=JSON.parse(message.data),kind=event.kind;if(event.session_id!==activeId)return;switch(kind.type){case"state":{const session=active();if(session){session.state=kind.data.state;session.last_error=kind.data.message||session.last_error;renderAll()}break}case"subtitle":cues().set(kind.data.cue_id,kind.data);renderSidebar();renderTimeline();if(panelOpen)renderPanel();break;case"playback":if(kind.data.event_type==="started")playingSegmentId=kind.data.segment_id;else if(["finished","cancelled","failed","expired"].includes(kind.data.event_type)&&playingSegmentId===kind.data.segment_id)playingSegmentId=null;renderTimeline();break;case"metrics":if(active())active().metrics=kind.data;if(panelOpen&&debug)renderPanel();break;case"history_cleared":cues().clear();renderAll();break;case"warning":toast(kind.data.message);break;case"error":toast(kind.data.message,true);refreshSessions();break}};ws.onclose=()=>{if(activeId)setTimeout(()=>{if(!ws||ws.readyState===WebSocket.CLOSED)connect()},1200)}}
+function connect(){
+  if(ws)ws.close();
+  if(!activeId)return;
+  const id=activeId,protocol=location.protocol==="https:"?"wss":"ws";
+  const socket=new WebSocket(`${protocol}://${location.host}/api/sessions/${id}/ws`);
+  const stream={socket,instanceId:null,sequence:0,synced:false,buffer:[]};
+  ws=socket;
+  const resync=()=>{if(ws===socket){stream.synced=false;stream.buffer=[];socket.close()}};
+  const applyEvent=event=>{
+    if(event.session_id!==id||id!==activeId)return;
+    if(stream.instanceId&&event.instance_id!==stream.instanceId){resync();return}
+    if(event.sequence<=stream.sequence)return;
+    if(!stream.synced||event.sequence!==stream.sequence+1){resync();return}
+    stream.sequence=event.sequence;
+    const session=active();
+    if(session)session.epoch=event.epoch;
+    const kind=event.kind;
+    switch(kind.type){
+      case"state":if(session){session.state=kind.data.state;session.last_error=kind.data.message||session.last_error;renderAll()}break;
+      case"subtitle":cues().set(kind.data.cue_id,kind.data);renderSidebar();renderTimeline();if(panelOpen)renderPanel();break;
+      case"playback":if(kind.data.event_type==="started")playingSegmentId=kind.data.segment_id;else if(["finished","cancelled","failed","expired"].includes(kind.data.event_type)&&playingSegmentId===kind.data.segment_id)playingSegmentId=null;renderTimeline();break;
+      case"metrics":if(active())active().metrics=kind.data;if(panelOpen&&debug)renderPanel();break;
+      case"history_cleared":cues().clear();renderAll();break;
+      case"warning":toast(kind.data.message);break;
+      case"error":toast(kind.data.message,true);refreshSessions().catch(error=>toast(error.message,true));break;
+    }
+  };
+  const applyBaseline=baseline=>{
+    if(id!==activeId||baseline.session_id!==id)return;
+    stream.instanceId=baseline.instance_id;
+    stream.sequence=baseline.sequence;
+    replaceSnapshot(baseline.snapshot);
+    histories.set(id,new Map(baseline.history.map(cue=>[cue.cue_id,cue])));
+    playingSegmentId=null;
+    stream.synced=true;
+    const pending=stream.buffer.splice(0).sort((a,b)=>a.sequence-b.sequence);
+    renderAll();
+    for(const event of pending){if(!stream.synced)break;applyEvent(event)}
+  };
+  socket.onopen=()=>socket.send(JSON.stringify({type:"authenticate",token:authToken}));
+  socket.onmessage=message=>{
+    if(ws!==socket)return;
+    try{
+      const packet=JSON.parse(message.data);
+      if(packet.type==="baseline")applyBaseline(packet.data);
+      else if(packet.type==="event"){if(stream.synced)applyEvent(packet.data);else if(stream.buffer.length<512)stream.buffer.push(packet.data);else resync()}
+      else if(packet.type==="resync_required"){stream.synced=false;stream.buffer=[]}
+      else resync();
+    }catch{resync()}
+  };
+  socket.onclose=()=>{if(ws!==socket)return;stream.synced=false;setTimeout(()=>{if(ws===socket&&activeId===id)connect()},1200)};
+}
 async function selectSession(id){if(id===activeId){document.body.classList.remove("mobile-nav-open");return}const running=sessions.find(item=>item.state==="running"&&item.session_id!==id);await run(async()=>{if(running)replaceSnapshot(await api(`/api/sessions/${running.session_id}/stop`,{method:"POST",body:"{}"}));activeId=id;localStorage.setItem("echonote.session",id);playingSegmentId=null;if(!histories.has(id))await loadHistory(id);connect();autoFollow=true;document.body.classList.remove("mobile-nav-open");renderAll(true)})}
 function configForNew(source){const config=structuredClone(baseConfig),previous=active();config.latency_mode=voicePolicy;config.source=source||structuredClone(previous?.config.source||baseConfig.source);if(previous&&previous.config.translator.type==="hy_simulmt")config.translator.direction=direction(previous);config.output.voice=config.translator.direction==="en-zh"?"Tingting":"Ava (Enhanced)";return config}
 async function createSession(source,title){await run(async()=>{let session=await api("/api/sessions",{method:"POST",body:JSON.stringify(configForNew(source))});const fallback=title||`未命名同传 · ${pad(sessions.length+1)}`;session=await api(`/api/sessions/${session.session_id}/title`,{method:"PUT",body:JSON.stringify({title:fallback})});replaceSnapshot(session);activeId=session.session_id;localStorage.setItem("echonote.session",activeId);histories.set(activeId,new Map());playingSegmentId=null;connect();closeMenus();renderAll(true)})}

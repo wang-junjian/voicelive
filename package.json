@@ -10,6 +10,7 @@
     "dev": "node scripts/dev.mjs",
     "build": "./build.sh",
     "test": "cargo test --workspace",
+    "test:ws": "node tests/pipeline/ws_resync.mjs",
     "test:browser": "node tests/pipeline/browser_acceptance.js"
   },
   "devDependencies": {

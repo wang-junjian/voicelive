@@ -12,6 +12,8 @@ hound.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
+serde_yaml.workspace = true
 simulmt-api = { path = "../../crates/api" }
 simulmt-core = { path = "../../crates/core" }
 tokio.workspace = true

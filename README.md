@@ -31,6 +31,7 @@
 - 轮换与异常恢复会重放已写入但尚未确认的音频，进程内片段 ID 保持连续。
 - 双语字幕事件、`AVSpeechSynthesizer` 合成与独立原生播放器；三档策略同时作用于组句和播放队列。
 - 本地 Web 控制台和独立 macOS WKWebView 窗口。
+- **一致的实时契约**：WebSocket 先发布原子 baseline，再按 `instance_id + sequence` 发布增量事件；客户端检测重复、序号空洞和 Core 重启，Lagged 后完整重同步。REST 错误统一包含稳定错误码、retryable 和 request ID。接口文档由 Rust 类型生成到 `api/openapi.yaml` 并由 CI 校验。
 - **本机控制面安全**：Core 只接受数字 loopback 监听地址；每次启动生成 256-bit token 和 instance ID，写入权限为 `0600` 的 `runtime/bootstrap.json`。REST/下载/上传使用 Bearer，WebSocket 校验 Origin 并要求首条消息认证；Host/Origin 采用精确 allowlist，token 不进入 query string 或 Core 日志。模型、播放器、runtime 和缓存路径属于启动期部署配置，普通会话 API 无法指定。
 
 ## 构建与运行
@@ -85,6 +86,7 @@ npm run dev -- --host 127.0.0.1 --port 7100
 cargo test --workspace --locked
 python3 tests/pipeline/acceptance_echonote.py  # 自行启动隔离 Core，使用 mock 链路
 python3 tests/pipeline/security_boundary.py   # 认证、来源、路径和非 loopback 负向验收
+node tests/pipeline/ws_resync.mjs           # baseline、重连、序号与统一错误契约
 npm install
 npx playwright install --no-shell chromium
 npm run test:browser                    # 独立 Core + Chromium 浏览器验收

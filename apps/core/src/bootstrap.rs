@@ -9,7 +9,6 @@ use std::os::unix::fs::OpenOptionsExt;
 
 pub(crate) struct StartupIdentity {
     pub token: String,
-    #[allow(dead_code)]
     pub instance_id: Uuid,
 }
 

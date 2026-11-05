@@ -1,6 +1,8 @@
 mod auth;
 mod bootstrap;
+mod contract;
 mod media;
+mod openapi;
 
 use auth::{LocalAuth, authorize, security_error};
 use axum::body::Body;
@@ -10,6 +12,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router, middleware};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use simulmt_api::*;
 use simulmt_core::{
@@ -33,14 +36,19 @@ struct AppState {
     auth: LocalAuth,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct Health {
     api_version: &'static str,
+    instance_id: Uuid,
     status: &'static str,
 }
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().any(|argument| argument == "--print-openapi") {
+        print!("{}", openapi::document_yaml());
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -80,10 +88,15 @@ async fn main() {
     tokio::fs::create_dir_all(&runtime)
         .await
         .expect("create runtime directory");
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("bind local API");
+    let identity = bootstrap::publish(&runtime, address).expect("publish owner-only bootstrap");
     let manager = Arc::new(
         SessionManager::load(CoreOptions {
             audio_host: audio_host.clone(),
             runtime_dir: runtime.to_string_lossy().into_owned(),
+            instance_id: identity.instance_id,
             deployment: DeploymentConfig {
                 model_executable: demo.join("llama.cpp-hyv3/build/bin/llama-mtmd-cli"),
                 model_path: demo.join("models/Hy-SimulMT-30B-A3B-Interleave-Q4_K_M.gguf"),
@@ -93,10 +106,6 @@ async fn main() {
         .await
         .expect("restore local sessions"),
     );
-    let listener = tokio::net::TcpListener::bind(address)
-        .await
-        .expect("bind local API");
-    let identity = bootstrap::publish(&runtime, address).expect("publish owner-only bootstrap");
     let auth = LocalAuth::new(address, identity.token.clone());
     let state = AppState {
         manager: Arc::clone(&manager),
@@ -141,7 +150,8 @@ async fn main() {
         .fallback_service(ServeDir::new(&web).fallback(ServeFile::new(web.join("index.html"))))
         .with_state(state)
         .layer(DefaultBodyLimit::max(1024 * 1024))
-        .layer(middleware::from_fn_with_state(auth, authorize));
+        .layer(middleware::from_fn_with_state(auth, authorize))
+        .layer(middleware::from_fn(contract::request_context));
     tracing::info!("EchoNote listening on http://{address}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -165,9 +175,10 @@ async fn main() {
         .expect("serve local API");
 }
 
-async fn health() -> Json<Health> {
+async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         api_version: API_VERSION,
+        instance_id: state.manager.instance_id(),
         status: "ok",
     })
 }
@@ -176,7 +187,7 @@ async fn sources(State(state): State<AppState>) -> Result<Json<Vec<SourceInfo>>,
     Ok(Json(list_macos_sources(&state.audio_host).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct MediaUploadQuery {
     name: Option<String>,
 }
@@ -291,7 +302,7 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct SessionTitle {
     title: String,
 }
@@ -361,7 +372,7 @@ async fn stop(
     Ok(Json(session.snapshot().await))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct SourceSelection {
     source: SourceConfig,
     mute_original: bool,
@@ -389,7 +400,7 @@ async fn set_source(
     Ok(Json(session.snapshot().await))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct DirectionSelection {
     direction: String,
 }
@@ -404,7 +415,7 @@ async fn set_direction(
     Ok(Json(session.snapshot().await))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct LatencySelection {
     latency_mode: LatencyMode,
 }
@@ -529,10 +540,10 @@ async fn websocket(
     Ok(ws
         .max_message_size(4 * 1024)
         .max_frame_size(4 * 1024)
-        .on_upgrade(move |socket| stream_events(socket, session.subscribe(), auth)))
+        .on_upgrade(move |socket| stream_events(socket, session, auth)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SocketAuthentication {
     #[serde(rename = "type")]
@@ -542,7 +553,7 @@ struct SocketAuthentication {
 
 async fn stream_events(
     mut socket: WebSocket,
-    mut events: tokio::sync::broadcast::Receiver<SessionEvent>,
+    session: Arc<simulmt_core::Session>,
     auth: LocalAuth,
 ) {
     let authenticated = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv())
@@ -566,20 +577,77 @@ async fn stream_events(
             .await;
         return;
     }
+    let (baseline, mut events) = match session.subscribe_baseline().await {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            tracing::warn!(session_id = %session.id, "failed to create WS baseline: {error}");
+            let _ = socket
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: "baseline unavailable".into(),
+                })))
+                .await;
+            return;
+        }
+    };
+    if send_stream_message(
+        &mut socket,
+        SessionStreamMessage::Baseline(Box::new(baseline)),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
     loop {
         match events.recv().await {
             Ok(event) => {
-                let text = serde_json::to_string(&event).expect("serialize event");
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                if send_stream_message(&mut socket, SessionStreamMessage::Event(event))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!("UI event receiver lagged by {skipped} events");
+                tracing::warn!(session_id = %session.id, "UI event receiver lagged by {skipped} events");
+                match session.subscribe_baseline().await {
+                    Ok((baseline, replacement)) => {
+                        let notice = SessionStreamMessage::ResyncRequired {
+                            instance_id: baseline.instance_id,
+                            session_id: baseline.session_id,
+                            sequence: baseline.sequence,
+                            reason: format!("event buffer overflowed; skipped {skipped} events"),
+                        };
+                        if send_stream_message(&mut socket, notice).await.is_err()
+                            || send_stream_message(
+                                &mut socket,
+                                SessionStreamMessage::Baseline(Box::new(baseline)),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        events = replacement;
+                    }
+                    Err(error) => {
+                        tracing::warn!(session_id = %session.id, "failed to resync WS baseline: {error}");
+                        break;
+                    }
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+async fn send_stream_message(
+    socket: &mut WebSocket,
+    message: SessionStreamMessage,
+) -> Result<(), axum::Error> {
+    let text = serde_json::to_string(&message).expect("serialize event");
+    socket.send(Message::Text(text.into())).await
 }
 
 struct ApiError(CoreError);
@@ -592,18 +660,60 @@ impl From<CoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
-            CoreError::SessionNotFound(_) => StatusCode::NOT_FOUND,
-            CoreError::InvalidState(_) | CoreError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
-            CoreError::PermissionDenied(_) => StatusCode::FORBIDDEN,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        let (status, code, component_id, retryable) = match &self.0 {
+            CoreError::SessionNotFound(_) => {
+                (StatusCode::NOT_FOUND, "session_not_found", "session", false)
+            }
+            CoreError::InvalidState(_) => (StatusCode::CONFLICT, "invalid_state", "session", false),
+            CoreError::InvalidConfig(_) => {
+                (StatusCode::BAD_REQUEST, "invalid_config", "session", false)
+            }
+            CoreError::PermissionDenied(_) => {
+                (StatusCode::FORBIDDEN, "permission_denied", "source", false)
+            }
+            CoreError::RoutingUnsafe(_) => {
+                (StatusCode::CONFLICT, "routing_unsafe", "source", false)
+            }
+            CoreError::Source(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "source_unavailable",
+                "source",
+                true,
+            ),
+            CoreError::Translator(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "translator_unavailable",
+                "translator",
+                true,
+            ),
+            CoreError::Output(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "output_unavailable",
+                "output",
+                true,
+            ),
+            CoreError::Storage(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "storage",
+                false,
+            ),
+            CoreError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "io_error", "core", false),
+            CoreError::Protocol(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "protocol_error",
+                "core",
+                false,
+            ),
+            CoreError::Policy(_) => (StatusCode::BAD_REQUEST, "invalid_policy", "policy", false),
         };
         let error = ErrorInfo {
-            code: "core_error".into(),
-            component_id: "core".into(),
+            code: code.into(),
+            component_id: component_id.into(),
             message: self.0.to_string(),
-            retryable: false,
+            retryable,
             fatal: false,
+            request_id: String::new(),
         };
         (status, Json(error)).into_response()
     }

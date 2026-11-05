@@ -104,8 +104,14 @@ pub(crate) fn security_error(status: StatusCode, code: &str, message: &str) -> R
         code: code.into(),
         component_id: "local_security".into(),
         message: message.into(),
-        retryable: false,
+        retryable: matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        ),
         fatal: false,
+        request_id: String::new(),
     };
     let mut response = (status, Json(body)).into_response();
     response

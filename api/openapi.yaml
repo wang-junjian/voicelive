@@ -1,0 +1,2457 @@
+components:
+  schemas:
+    DirectionSelection:
+      properties:
+        direction:
+          type: string
+      required:
+      - direction
+      type: object
+    ErrorInfo:
+      properties:
+        code:
+          type: string
+        component_id:
+          type: string
+        fatal:
+          type: boolean
+        message:
+          type: string
+        request_id:
+          description: Populated by the outer HTTP middleware; matches X-Request-Id.
+          type: string
+        retryable:
+          type: boolean
+      required:
+      - code
+      - component_id
+      - message
+      - retryable
+      - fatal
+      - request_id
+      type: object
+    Health:
+      properties:
+        api_version:
+          type: string
+        instance_id:
+          format: uuid
+          type: string
+        status:
+          type: string
+      required:
+      - api_version
+      - instance_id
+      - status
+      type: object
+    ImportedMedia:
+      properties:
+        name:
+          type: string
+        path:
+          type: string
+      required:
+      - name
+      - path
+      type: object
+    LatencyMode:
+      enum:
+      - low_latency
+      - balanced
+      - complete
+      type: string
+    LatencySelection:
+      properties:
+        latency_mode:
+          $ref: '#/components/schemas/LatencyMode'
+      required:
+      - latency_mode
+      type: object
+    MediaUploadQuery:
+      properties:
+        name:
+          type:
+          - string
+          - 'null'
+      type: object
+    OutputConfig:
+      oneOf:
+      - additionalProperties: false
+        properties:
+          type:
+            const: mock
+            type: string
+        required:
+        - type
+        type: object
+      - additionalProperties: false
+        properties:
+          speech_rate:
+            description: |-
+              Approximate words per minute for the resident system synthesizer.
+              Higher values shorten each segment and reduce playback backlog.
+            format: uint32
+            minimum: 0
+            type:
+            - integer
+            - 'null'
+          type:
+            const: macos_system
+            type: string
+          voice:
+            type:
+            - string
+            - 'null'
+        required:
+        - type
+        type: object
+    OverflowBehavior:
+      enum:
+      - block_producer
+      - drop_oldest_audio
+      - drop_newest_audio
+      - skip_stale_speech
+      - fail_session
+      type: string
+    PipelineConfig:
+      additionalProperties: false
+      properties:
+        latency_mode:
+          $ref: '#/components/schemas/LatencyMode'
+        mute_original:
+          type: boolean
+        output:
+          $ref: '#/components/schemas/OutputConfig'
+        queue:
+          $ref: '#/components/schemas/QueuePolicy'
+        source:
+          $ref: '#/components/schemas/SourceConfig'
+        translator:
+          $ref: '#/components/schemas/TranslatorConfig'
+      required:
+      - source
+      - translator
+      - output
+      - latency_mode
+      - queue
+      - mute_original
+      type: object
+    PlaybackEvent:
+      properties:
+        actual_start_mono_ns:
+          format: int64
+          type:
+          - integer
+          - 'null'
+        event_type:
+          $ref: '#/components/schemas/PlaybackEventType'
+        queue_duration_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        segment_id:
+          type: string
+        source_end_ns:
+          default: null
+          format: int64
+          type:
+          - integer
+          - 'null'
+        token:
+          format: uint64
+          minimum: 0
+          type: integer
+      required:
+      - event_type
+      - segment_id
+      - token
+      - queue_duration_us
+      type: object
+    PlaybackEventType:
+      enum:
+      - queued
+      - started
+      - finished
+      - cancelled
+      - expired
+      - failed
+      type: string
+    QueuePolicy:
+      properties:
+        max_buffered_duration_us:
+          format: uint32
+          minimum: 0
+          type: integer
+        max_frames:
+          format: uint
+          minimum: 0
+          type: integer
+        max_model_backlog_us:
+          format: uint32
+          minimum: 0
+          type: integer
+        overflow_behavior:
+          $ref: '#/components/schemas/OverflowBehavior'
+      required:
+      - max_frames
+      - max_buffered_duration_us
+      - max_model_backlog_us
+      - overflow_behavior
+      type: object
+    SessionBaseline:
+      description: Authoritative state at `sequence`; live events begin at `sequence + 1`.
+      properties:
+        api_version:
+          type: string
+        history:
+          items:
+            $ref: '#/components/schemas/SubtitleCue'
+          type: array
+        instance_id:
+          format: uuid
+          type: string
+        sequence:
+          format: uint64
+          minimum: 0
+          type: integer
+        session_id:
+          format: uuid
+          type: string
+        snapshot:
+          $ref: '#/components/schemas/SessionSnapshot'
+      required:
+      - api_version
+      - instance_id
+      - session_id
+      - sequence
+      - snapshot
+      - history
+      type: object
+    SessionEvent:
+      properties:
+        api_version:
+          type: string
+        emitted_mono_ns:
+          format: int64
+          type: integer
+        epoch:
+          format: uint64
+          minimum: 0
+          type: integer
+        instance_id:
+          description: Identifies one Core process lifetime. A change invalidates every cursor.
+          format: uuid
+          type: string
+        kind:
+          $ref: '#/components/schemas/SessionEventKind'
+        sequence:
+          description: Monotonically increasing within instance_id + session_id, starting at 1.
+          format: uint64
+          minimum: 0
+          type: integer
+        session_id:
+          format: uuid
+          type: string
+      required:
+      - api_version
+      - instance_id
+      - session_id
+      - sequence
+      - epoch
+      - emitted_mono_ns
+      - kind
+      type: object
+    SessionEventKind:
+      oneOf:
+      - properties:
+          data:
+            properties:
+              message:
+                type:
+                - string
+                - 'null'
+              state:
+                $ref: '#/components/schemas/SessionState'
+            required:
+            - state
+            type: object
+          type:
+            const: state
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          data:
+            $ref: '#/components/schemas/TranslationEvent'
+          type:
+            const: translation
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          data:
+            $ref: '#/components/schemas/SubtitleCue'
+          type:
+            const: subtitle
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          type:
+            const: history_cleared
+            type: string
+        required:
+        - type
+        type: object
+      - properties:
+          data:
+            $ref: '#/components/schemas/PlaybackEvent'
+          type:
+            const: playback
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          data:
+            $ref: '#/components/schemas/SessionMetrics'
+          type:
+            const: metrics
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          data:
+            properties:
+              code:
+                type: string
+              message:
+                type: string
+            required:
+            - code
+            - message
+            type: object
+          type:
+            const: warning
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          data:
+            properties:
+              code:
+                type: string
+              fatal:
+                type: boolean
+              message:
+                type: string
+            required:
+            - code
+            - message
+            - fatal
+            type: object
+          type:
+            const: error
+            type: string
+        required:
+        - type
+        - data
+        type: object
+    SessionMetrics:
+      properties:
+        captured_duration_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        captured_frames:
+          format: uint64
+          minimum: 0
+          type: integer
+        completed_duration_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        context_position:
+          format: uint32
+          minimum: 0
+          type: integer
+        context_rotations:
+          format: uint64
+          minimum: 0
+          type: integer
+        dropped_duration_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        dropped_frames:
+          format: uint64
+          minimum: 0
+          type: integer
+        max_output_latency_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        max_playback_lag_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        model_backlog_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        model_restarts:
+          format: uint64
+          minimum: 0
+          type: integer
+        output_latency_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        playback_cancelled:
+          format: uint64
+          minimum: 0
+          type: integer
+        playback_finished:
+          format: uint64
+          minimum: 0
+          type: integer
+        playback_lag_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        playback_pending:
+          default: 0
+          format: uint64
+          minimum: 0
+          type: integer
+        playback_started:
+          format: uint64
+          minimum: 0
+          type: integer
+        sent_duration_us:
+          format: uint64
+          minimum: 0
+          type: integer
+        sent_frames:
+          format: uint64
+          minimum: 0
+          type: integer
+        source_resets:
+          format: uint64
+          minimum: 0
+          type: integer
+        translations:
+          format: uint64
+          minimum: 0
+          type: integer
+        tts_queue_depth:
+          format: uint32
+          minimum: 0
+          type: integer
+      required:
+      - captured_frames
+      - captured_duration_us
+      - sent_frames
+      - sent_duration_us
+      - completed_duration_us
+      - dropped_frames
+      - dropped_duration_us
+      - model_backlog_us
+      - context_position
+      - tts_queue_depth
+      - translations
+      - playback_started
+      - playback_finished
+      - playback_cancelled
+      - output_latency_us
+      - max_output_latency_us
+      - playback_lag_us
+      - max_playback_lag_us
+      - context_rotations
+      - model_restarts
+      - source_resets
+      type: object
+    SessionSnapshot:
+      properties:
+        api_version:
+          type: string
+        config:
+          $ref: '#/components/schemas/PipelineConfig'
+        created_at_ms:
+          format: int64
+          type: integer
+        ended_at_ms:
+          format: int64
+          type:
+          - integer
+          - 'null'
+        epoch:
+          format: uint64
+          minimum: 0
+          type: integer
+        event_sequence:
+          format: uint64
+          minimum: 0
+          type: integer
+        instance_id:
+          format: uuid
+          type: string
+        last_error:
+          type:
+          - string
+          - 'null'
+        metrics:
+          $ref: '#/components/schemas/SessionMetrics'
+        session_id:
+          format: uuid
+          type: string
+        started_at_ms:
+          format: int64
+          type:
+          - integer
+          - 'null'
+        state:
+          $ref: '#/components/schemas/SessionState'
+        title:
+          type: string
+      required:
+      - api_version
+      - instance_id
+      - session_id
+      - event_sequence
+      - epoch
+      - state
+      - title
+      - created_at_ms
+      - config
+      - metrics
+      type: object
+    SessionState:
+      enum:
+      - idle
+      - configuring
+      - preparing
+      - ready
+      - running
+      - paused
+      - stopping
+      - faulted
+      type: string
+    SessionStreamMessage:
+      oneOf:
+      - properties:
+          data:
+            $ref: '#/components/schemas/SessionBaseline'
+          type:
+            const: baseline
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          data:
+            $ref: '#/components/schemas/SessionEvent'
+          type:
+            const: event
+            type: string
+        required:
+        - type
+        - data
+        type: object
+      - properties:
+          data:
+            properties:
+              instance_id:
+                format: uuid
+                type: string
+              reason:
+                type: string
+              sequence:
+                format: uint64
+                minimum: 0
+                type: integer
+              session_id:
+                format: uuid
+                type: string
+            required:
+            - instance_id
+            - session_id
+            - sequence
+            - reason
+            type: object
+          type:
+            const: resync_required
+            type: string
+        required:
+        - type
+        - data
+        type: object
+    SessionTitle:
+      properties:
+        title:
+          type: string
+      required:
+      - title
+      type: object
+    SocketAuthentication:
+      additionalProperties: false
+      properties:
+        token:
+          type: string
+        type:
+          type: string
+      required:
+      - type
+      - token
+      type: object
+    SourceConfig:
+      oneOf:
+      - additionalProperties: false
+        properties:
+          frames:
+            format: uint32
+            minimum: 0
+            type:
+            - integer
+            - 'null'
+          type:
+            const: mock
+            type: string
+        required:
+        - type
+        type: object
+      - additionalProperties: false
+        properties:
+          path:
+            type: string
+          realtime:
+            type: boolean
+          type:
+            const: file
+            type: string
+        required:
+        - type
+        - path
+        - realtime
+        type: object
+      - additionalProperties: false
+        properties:
+          mute_original:
+            type: boolean
+          pids:
+            items:
+              format: uint32
+              minimum: 0
+              type: integer
+            type: array
+          type:
+            const: macos_process
+            type: string
+        required:
+        - type
+        - pids
+        - mute_original
+        type: object
+      - additionalProperties: false
+        properties:
+          exclude_pids:
+            items:
+              format: uint32
+              minimum: 0
+              type: integer
+            type: array
+          mute_original:
+            type: boolean
+          type:
+            const: macos_system
+            type: string
+        required:
+        - type
+        - exclude_pids
+        - mute_original
+        type: object
+      - additionalProperties: false
+        properties:
+          type:
+            const: macos_microphone
+            type: string
+        required:
+        - type
+        type: object
+    SourceInfo:
+      properties:
+        bundle_id:
+          type:
+          - string
+          - 'null'
+        can_exclude_sink:
+          type: boolean
+        can_mute:
+          type: boolean
+        is_running:
+          type: boolean
+        kind:
+          type: string
+        name:
+          type: string
+        pid:
+          format: uint32
+          minimum: 0
+          type:
+          - integer
+          - 'null'
+        source_id:
+          type: string
+      required:
+      - source_id
+      - kind
+      - name
+      - can_mute
+      - can_exclude_sink
+      - is_running
+      type: object
+    SourceSelection:
+      properties:
+        mute_original:
+          type: boolean
+        source:
+          $ref: '#/components/schemas/SourceConfig'
+      required:
+      - source
+      - mute_original
+      type: object
+    SubtitleCue:
+      properties:
+        cue_id:
+          type: string
+        is_final:
+          type: boolean
+        revision:
+          format: uint64
+          minimum: 0
+          type: integer
+        segment_ids:
+          default: []
+          items:
+            type: string
+          type: array
+        source_end_ns:
+          format: int64
+          type: integer
+        source_start_ns:
+          format: int64
+          type: integer
+        source_text:
+          type: string
+        translated_text:
+          type: string
+      required:
+      - cue_id
+      - revision
+      - source_text
+      - translated_text
+      - source_start_ns
+      - source_end_ns
+      - is_final
+      type: object
+    TranslationEvent:
+      properties:
+        epoch:
+          format: uint64
+          minimum: 0
+          type: integer
+        event_type:
+          $ref: '#/components/schemas/TranslationEventType'
+        generation_duration_us:
+          format: uint32
+          minimum: 0
+          type: integer
+        generation_finished_ns:
+          format: int64
+          type: integer
+        generation_started_ns:
+          format: int64
+          type: integer
+        revision:
+          format: uint64
+          minimum: 0
+          type: integer
+        segment_id:
+          type: string
+        session_id:
+          format: uuid
+          type: string
+        source_end_ns:
+          format: int64
+          type:
+          - integer
+          - 'null'
+        source_generation:
+          default: 0
+          format: uint64
+          minimum: 0
+          type: integer
+        source_start_ns:
+          format: int64
+          type:
+          - integer
+          - 'null'
+        source_text:
+          type: string
+        speakable:
+          type: boolean
+        translated_text:
+          type: string
+      required:
+      - session_id
+      - epoch
+      - segment_id
+      - revision
+      - event_type
+      - source_text
+      - translated_text
+      - generation_started_ns
+      - generation_finished_ns
+      - generation_duration_us
+      - speakable
+      type: object
+    TranslationEventType:
+      enum:
+      - append
+      - revise
+      - final
+      - reset
+      type: string
+    TranslatorConfig:
+      oneOf:
+      - additionalProperties: false
+        properties:
+          type:
+            const: mock
+            type: string
+        required:
+        - type
+        type: object
+      - additionalProperties: false
+        properties:
+          context:
+            format: uint32
+            minimum: 0
+            type:
+            - integer
+            - 'null'
+          direction:
+            type: string
+          n_predict:
+            format: uint32
+            minimum: 0
+            type:
+            - integer
+            - 'null'
+          type:
+            const: hy_simulmt
+            type: string
+        required:
+        - type
+        - direction
+        type: object
+  securitySchemes:
+    bearerAuth:
+      scheme: bearer
+      type: http
+info:
+  description: Loopback-only, bearer-authenticated REST and WebSocket API. Error responses use ErrorInfo and every response carries X-Request-Id.
+  title: EchoNote Local Control Plane
+  version: simulmt.api.v1
+openapi: 3.0.4
+paths:
+  /api/default-config:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PipelineConfig'
+          description: Default public pipeline configuration
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/health:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+          description: Core liveness and process identity
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+      security: []
+  /api/media:
+    post:
+      parameters:
+      - in: query
+        name: name
+        required: false
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              format: binary
+              type: string
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportedMedia'
+          description: Imported normalized WAV
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '504':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '507':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SessionSnapshot'
+                type: array
+          description: All sessions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineConfig'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}:
+    delete:
+      responses:
+        '204':
+          description: Session deleted
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+  /api/sessions/{id}/config:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PipelineConfig'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/direction:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DirectionSelection'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/export.srt:
+    get:
+      responses:
+        '200':
+          content:
+            application/x-subrip:
+              schema:
+                format: binary
+                type: string
+          description: Strict snapshot export
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+  /api/sessions/{id}/export.vtt:
+    get:
+      responses:
+        '200':
+          content:
+            text/vtt:
+              schema:
+                format: binary
+                type: string
+          description: Strict snapshot export
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+  /api/sessions/{id}/export.wav:
+    get:
+      responses:
+        '200':
+          content:
+            audio/wav:
+              schema:
+                format: binary
+                type: string
+          description: Strict snapshot export
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+  /api/sessions/{id}/history:
+    delete:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SubtitleCue'
+                type: array
+          description: Complete session subtitle history
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SubtitleCue'
+                type: array
+          description: Complete session subtitle history
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+  /api/sessions/{id}/latency-mode:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LatencySelection'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/pause:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    post:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/prepare:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    post:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/resume:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    post:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/source:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SourceSelection'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/start:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    post:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/stop:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    post:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/stop-model:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    post:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/title:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+    put:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionTitle'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionSnapshot'
+          description: Current authoritative session snapshot
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '500':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+  /api/sessions/{id}/ws:
+    get:
+      description: Authenticate in the first WebSocket message, then receive an atomic baseline and ordered events. The token is never accepted in the URL.
+      responses:
+        '101':
+          description: WebSocket upgrade; messages use SessionStreamMessage
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+      security: []
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        format: uuid
+        type: string
+  /api/sources:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/SourceInfo'
+                type: array
+          description: Available native audio sources
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInfo'
+          description: Structured error; retryable is authoritative for retry decisions
+          headers:
+            X-Request-Id:
+              schema:
+                format: uuid
+                type: string
+security:
+- bearerAuth: []
+servers:
+- url: http://127.0.0.1:8780

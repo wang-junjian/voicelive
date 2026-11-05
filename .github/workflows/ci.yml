@@ -16,6 +16,10 @@ jobs:
           node-version: 22
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check generated OpenAPI
+        run: |
+          cargo run -p simulmt-app --locked -- --print-openapi > api/openapi.yaml
+          git diff --exit-code -- api/openapi.yaml
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run Rust tests
@@ -24,6 +28,8 @@ jobs:
         run: ./build.sh
       - name: Run isolated HTTP acceptance
         run: python3 tests/pipeline/acceptance_echonote.py
+      - name: Run WebSocket contract acceptance
+        run: node tests/pipeline/ws_resync.mjs
       - name: Install browser test dependencies
         run: |
           npm ci

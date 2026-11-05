@@ -42,6 +42,7 @@ cargo test -p simulmt-core mock_session_covers_complete_lifecycle -- --nocapture
 # 先构建；脚本自行在随机端口启动 Core，使用临时 runtime 和 mock 链路
 python3 tests/pipeline/acceptance_echonote.py
 python3 tests/pipeline/security_boundary.py   # 本机认证、来源、路径和资源上限负向验收
+node tests/pipeline/ws_resync.mjs           # baseline、连续序号、重连、instance 和错误契约
 
 # 以下两个脚本连接已经运行的 Core（默认 8780）
 python3 tests/pipeline/http_mock.py
@@ -99,6 +100,8 @@ SourceConfig → RunningSource → AudioFrame（100 ms）
 [apps/core/src/main.rs](apps/core/src/main.rs) 是 Axum 应用入口：集中定义 REST 路由、每会话 WebSocket 事件流、媒体导入、SRT/VTT/WAV 导出、静态前端和运行路径配置。新增会话能力通常需要同时检查共享 API 类型、Core 方法、HTTP 路由和前端事件处理。
 
 - [apps/core/src/auth.rs](apps/core/src/auth.rs) 实施数字 loopback 的 Host/Origin 精确 allowlist 和 Bearer 认证；只有健康检查与静态控制台无需 Bearer。WebSocket 不接受 query token，必须在 5 秒内经首条 JSON 消息认证，认证前不发送事件。
+- 每个会话事件携带 Core `instance_id`、单调 `sequence` 和 run `epoch`。`Session::subscribe_baseline` 在事件发布锁内固定 snapshot、完整 history 和游标，并创建恰好从下一序号开始的订阅；Lagged 时发送 `resync_required` 和新 baseline。前端 baseline 前缓冲事件，重复序号幂等忽略，空洞、未知消息或实例变化会关闭旧游标并重连。
+- [apps/core/src/contract.rs](apps/core/src/contract.rs) 为所有响应添加 `X-Request-Id`，并将框架及 Core 错误统一为 `ErrorInfo`；生命周期冲突使用 409，schema 拒绝使用 400/422，`retryable` 明确区分暂时性故障。[api/openapi.yaml](api/openapi.yaml) 由 Rust JsonSchema 类型生成，快照测试和 CI diff 防止漏更新；更新命令为 `cargo run -p simulmt-app --locked -- --print-openapi > api/openapi.yaml`。
 - [apps/core/src/bootstrap.rs](apps/core/src/bootstrap.rs) 每次启动生成 256-bit token 和 instance ID，将 URL/token 原子写入 `runtime/bootstrap.json`（`0600`）。`run.sh`/`scripts/dev.mjs` 输出带 `#auth=` 的 URL，前端保存到 sessionStorage 后立即清除 fragment；token 不得进入 query string 或 Core 日志。
 - [apps/core/src/media.rs](apps/core/src/media.rs) 流式上传并有界写入 UUID 临时文件，限制输入、并发、解码时间、输出和磁盘余量。`afconvert` 使用固定路径，成功校验 PCM16 WAV 后原子发布，失败清理输入和临时输出。
 - 桌面 WKWebView 的原生媒体桥只接受 main frame、匹配 loopback origin 和空消息 schema，原生上传自行添加 Bearer。
