@@ -7,7 +7,9 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use simulmt_api::*;
-use simulmt_core::{CoreError, CoreOptions, SessionManager, list_macos_sources};
+use simulmt_core::{
+    CoreError, CoreOptions, SessionManager, SubtitleExportFormat, list_macos_sources,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -445,11 +447,16 @@ async fn export_srt(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let cues = state.manager.get(id).await?.history().await?;
+    let document = state
+        .manager
+        .get(id)
+        .await?
+        .export_subtitles(SubtitleExportFormat::Srt)
+        .await?;
     Ok(download_response(
         "simulmt-subtitles.srt",
         "application/x-subrip; charset=utf-8",
-        subtitle_document(&cues, false).into_bytes(),
+        document.into_bytes(),
     ))
 }
 
@@ -457,11 +464,16 @@ async fn export_vtt(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let cues = state.manager.get(id).await?.history().await?;
+    let document = state
+        .manager
+        .get(id)
+        .await?
+        .export_subtitles(SubtitleExportFormat::Vtt)
+        .await?;
     Ok(download_response(
         "simulmt-subtitles.vtt",
         "text/vtt; charset=utf-8",
-        subtitle_document(&cues, true).into_bytes(),
+        document.into_bytes(),
     ))
 }
 
@@ -513,41 +525,6 @@ fn download_headers(filename: &'static str, content_type: &'static str) -> Heade
             .expect("valid download header"),
     );
     headers
-}
-
-fn subtitle_document(cues: &[SubtitleCue], vtt: bool) -> String {
-    let mut output = if vtt {
-        "WEBVTT\n\n".to_string()
-    } else {
-        String::new()
-    };
-    for (index, cue) in cues.iter().enumerate() {
-        if !vtt {
-            output.push_str(&(index + 1).to_string());
-            output.push('\n');
-        }
-        output.push_str(&format!(
-            "{} --> {}\n{}\n{}\n\n",
-            subtitle_time(cue.source_start_ns, vtt),
-            subtitle_time(
-                cue.source_end_ns.max(cue.source_start_ns + 400_000_000),
-                vtt
-            ),
-            cue.source_text,
-            cue.translated_text
-        ));
-    }
-    output
-}
-
-fn subtitle_time(ns: i64, vtt: bool) -> String {
-    let total_ms = (ns.max(0) / 1_000_000) as u64;
-    let hours = total_ms / 3_600_000;
-    let minutes = total_ms / 60_000 % 60;
-    let seconds = total_ms / 1_000 % 60;
-    let millis = total_ms % 1_000;
-    let separator = if vtt { '.' } else { ',' };
-    format!("{hours:02}:{minutes:02}:{seconds:02}{separator}{millis:03}")
 }
 
 async fn websocket(

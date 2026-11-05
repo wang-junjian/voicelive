@@ -36,6 +36,12 @@ pub struct SpeechSegment {
     pub source_end_ns: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExportSnapshot {
+    pub cues: Vec<SubtitleCue>,
+    pub speech_segments: Vec<SpeechSegment>,
+}
+
 /// A single SQLite connection, used only from short blocking tasks.
 ///
 /// Async callers never hold the connection mutex across an await. WAL permits
@@ -218,6 +224,21 @@ impl Store {
             .await
     }
 
+    /// Captures cue revisions and speech rows under one SQLite read snapshot.
+    /// Later writes cannot alter the owned vectors returned to an export.
+    pub async fn export_snapshot(&self, session_id: Uuid) -> Result<ExportSnapshot> {
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            let snapshot = ExportSnapshot {
+                cues: history_sync(&transaction, session_id)?,
+                speech_segments: speech_segments_sync(&transaction, session_id)?,
+            };
+            transaction.commit()?;
+            Ok(snapshot)
+        })
+        .await
+    }
+
     pub async fn clear_history(&self, session_id: Uuid) -> Result<()> {
         self.run(move |connection| {
             connection.execute(
@@ -317,35 +338,10 @@ impl Store {
         .await
     }
 
+    #[cfg(test)]
     pub async fn speech_segments(&self, session_id: Uuid) -> Result<Vec<SpeechSegment>> {
-        self.run(move |connection| {
-            let mut statement = connection.prepare(
-                "SELECT token, segment_id, path, status, source_end_ns
-                 FROM speech_segments WHERE session_id = ?1 ORDER BY token",
-            )?;
-            let rows = statement.query_map(params![session_id.to_string()], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                ))
-            })?;
-            let mut segments = Vec::new();
-            for row in rows {
-                let (token, segment_id, path, status, source_end_ns) = row?;
-                segments.push(SpeechSegment {
-                    token: token.max(0) as u64,
-                    segment_id,
-                    path: PathBuf::from(path),
-                    status,
-                    source_end_ns,
-                });
-            }
-            Ok(segments)
-        })
-        .await
+        self.run(move |connection| speech_segments_sync(connection, session_id))
+            .await
     }
 
     pub async fn migrate_legacy(&self, runtime_dir: PathBuf) -> Result<()> {
@@ -511,6 +507,34 @@ fn history_sync(connection: &Connection, session_id: Uuid) -> Result<Vec<Subtitl
         });
     }
     Ok(cues)
+}
+
+fn speech_segments_sync(connection: &Connection, session_id: Uuid) -> Result<Vec<SpeechSegment>> {
+    let mut statement = connection.prepare(
+        "SELECT token, segment_id, path, status, source_end_ns
+         FROM speech_segments WHERE session_id = ?1 ORDER BY token",
+    )?;
+    let rows = statement.query_map(params![session_id.to_string()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<i64>>(4)?,
+        ))
+    })?;
+    let mut segments = Vec::new();
+    for row in rows {
+        let (token, segment_id, path, status, source_end_ns) = row?;
+        segments.push(SpeechSegment {
+            token: token.max(0) as u64,
+            segment_id,
+            path: PathBuf::from(path),
+            status,
+            source_end_ns,
+        });
+    }
+    Ok(segments)
 }
 
 fn speech_status(event_type: PlaybackEventType) -> &'static str {
@@ -1104,6 +1128,80 @@ mod tests {
             speech[0].path,
             root.path().join(format!("speech-{id}-9.wav"))
         );
+    }
+
+    #[tokio::test]
+    async fn export_snapshot_keeps_original_cue_revisions_and_speech_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(root.path()).unwrap();
+        let id = Uuid::new_v4();
+        store
+            .save_session(StoredSession {
+                id,
+                config: PipelineConfig::default(),
+                metadata: SessionMetadata {
+                    title: "snapshot".into(),
+                    created_at_ms: 1,
+                    started_at_ms: None,
+                    ended_at_ms: None,
+                    audio_duration_us: 0,
+                },
+            })
+            .await
+            .unwrap();
+        store
+            .record_cue(id, cue("cue", 1, 0, "snapshot draft"))
+            .await
+            .unwrap();
+        for event_type in [
+            PlaybackEventType::Queued,
+            PlaybackEventType::Started,
+            PlaybackEventType::Finished,
+        ] {
+            store
+                .record_playback(
+                    id,
+                    root.path().to_path_buf(),
+                    PlaybackEvent {
+                        event_type,
+                        segment_id: "segment-1".into(),
+                        token: 1,
+                        queue_duration_us: 0,
+                        actual_start_mono_ns: None,
+                        source_end_ns: Some(800_000_000),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let snapshot = store.export_snapshot(id).await.unwrap();
+        store
+            .record_cue(id, cue("cue", 2, 0, "later revision"))
+            .await
+            .unwrap();
+        store
+            .record_playback(
+                id,
+                root.path().to_path_buf(),
+                PlaybackEvent {
+                    event_type: PlaybackEventType::Queued,
+                    segment_id: "segment-2".into(),
+                    token: 2,
+                    queue_duration_us: 0,
+                    actual_start_mono_ns: None,
+                    source_end_ns: Some(1_600_000_000),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(snapshot.cues[0].revision, 1);
+        assert_eq!(snapshot.cues[0].source_text, "snapshot draft");
+        assert_eq!(snapshot.speech_segments.len(), 1);
+        assert_eq!(snapshot.speech_segments[0].status, "ready");
+        assert_eq!(store.history(id).await.unwrap()[0].revision, 2);
+        assert_eq!(store.speech_segments(id).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

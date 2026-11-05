@@ -83,6 +83,7 @@ SourceConfig → RunningSource → AudioFrame（100 ms）
 - 全局只有一个常驻模型。`SessionManager::prepare` 会将其他会话的 `Ready` 模型 detach/adopt 到新会话；`RunningTranslator::reattach` 重定向事件并清理音频和语言上下文，避免重复加载权重。新建会话也会停止其他会话的活动采集。
 - `runtime/echonote.db` 使用 SQLite WAL、单写入连接和 `synchronous=FULL`，保存会话、字幕修订、segment 关联、语音清单和迁移账本；WAV/媒体仍存文件系统。字幕与播放状态先提交数据库再广播。内存历史最多 512 条，数据库历史完整保留。重启只恢复配置、元数据和字幕，所有运行状态恢复为 `Idle`，不会恢复进程或 Tap。
 - 旧 `runtime/sessions/*.json`、`runtime/subtitles/*.jsonl` 和已有语音 WAV 在启动时只读迁移并保留原文件；迁移按 revision/timeline 重置拆分重复旧 cue，使用确定性 UUID 和逐行账本保证可重入。媒体、模型日志和 TTS 缓存也在 `runtime/` 下。
+- [crates/core/src/export.rs](crates/core/src/export.rs) 从同一 SQLite 只读事务快照固定字幕 revision 和语音清单；SRT 保留文本，VTT 转义 `&`/`<`/`>`。WAV 严格校验 ready 状态、PCM16 格式和完整数据，以 64 KiB 缓冲流式拼接，fsync 后通过唯一临时文件原子发布；缺段、截断、格式不一致或读取期间文件变化均报错。
 
 ### 3. 适配器与原生进程协议
 

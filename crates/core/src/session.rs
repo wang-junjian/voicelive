@@ -1,4 +1,5 @@
 use crate::error::{CoreError, Result};
+use crate::export::SubtitleExportFormat;
 use crate::lifecycle::Lifecycle;
 use crate::output::{OutputRunner, OutputSignal, PlaybackControl};
 use crate::source::RunningSource;
@@ -1396,6 +1397,13 @@ impl Session {
         self.emit(SessionEventKind::Subtitle(cue));
     }
 
+    pub async fn export_subtitles(&self, format: SubtitleExportFormat) -> Result<String> {
+        let cues = self.store.export_snapshot(self.id).await?.cues;
+        tokio::task::spawn_blocking(move || crate::export::render_subtitles(&cues, format))
+            .await
+            .map_err(|error| CoreError::Output(format!("subtitle export task failed: {error}")))
+    }
+
     pub async fn export_wav(&self) -> Result<PathBuf> {
         let cache_dir = match &*self.config.read().await {
             PipelineConfig {
@@ -1408,7 +1416,7 @@ impl Session {
                 ));
             }
         };
-        let segments = self.store.speech_segments(self.id).await?;
+        let segments = self.store.export_snapshot(self.id).await?.speech_segments;
         crate::export::export_wav(self.id, segments, cache_dir).await
     }
 
