@@ -38,9 +38,15 @@ pub trait PlaybackControl: Send {
 
 pub struct OutputRunner;
 
+pub struct OutputPaths<'a> {
+    pub player_path: &'a Path,
+    pub cache_dir: &'a Path,
+}
+
 impl OutputRunner {
     pub async fn start(
         config: &OutputConfig,
+        paths: OutputPaths<'_>,
         latency_mode: LatencyMode,
         session_id: Uuid,
         epoch: u64,
@@ -52,14 +58,9 @@ impl OutputRunner {
                 sender,
                 next_token: first_token.saturating_sub(1),
             })),
-            OutputConfig::MacosSystem {
-                player_path,
-                cache_dir,
-                voice,
-                speech_rate,
-            } => MacOutput::start(MacOutputStart {
-                player_path: player_path.clone(),
-                cache_dir: cache_dir.clone(),
+            OutputConfig::MacosSystem { voice, speech_rate } => MacOutput::start(MacOutputStart {
+                player_path: paths.player_path.to_string_lossy().into_owned(),
+                cache_dir: paths.cache_dir.to_string_lossy().into_owned(),
                 voice: voice.clone(),
                 speech_rate: *speech_rate,
                 latency_mode,

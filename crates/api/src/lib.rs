@@ -82,7 +82,7 @@ pub struct SourceInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceConfig {
     Mock {
         frames: Option<u32>,
@@ -109,13 +109,11 @@ impl Default for SourceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TranslatorConfig {
     #[default]
     Mock,
     HySimulmt {
-        executable: String,
-        model: String,
         direction: String,
         context: Option<u32>,
         n_predict: Option<u32>,
@@ -123,13 +121,11 @@ pub enum TranslatorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OutputConfig {
     #[default]
     Mock,
     MacosSystem {
-        player_path: String,
-        cache_dir: String,
         voice: Option<String>,
         /// Approximate words per minute for the resident system synthesizer.
         /// Higher values shorten each segment and reduce playback backlog.
@@ -175,6 +171,7 @@ impl Default for QueuePolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub source: SourceConfig,
     pub translator: TranslatorConfig,

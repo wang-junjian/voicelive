@@ -25,12 +25,13 @@
 - 100 ms 传输帧对齐为模型要求的 800 ms 块，有界队列、积压统计和丢弃指标。
 - 模拟音源、翻译器与播放器；PCM16 WAV 文件音源。
 - macOS Core Audio 进程／全局 Tap、AVAudioEngine 麦克风采集、原声静音与独立播放器排除。
-- 本地媒体通过 `afconvert` 解码为 16 kHz 单声道 PCM16 WAV；支持 WAV、MP3、M4A、AAC、FLAC、MP4、MOV、M4V，上传上限 1 GiB。实际可解码范围仍受 macOS 解码器支持限制。
+- 本地媒体通过流式上传写入受控媒体目录，再由 `afconvert` 解码为 16 kHz 单声道 PCM16 WAV；支持 WAV、MP3、M4A、AAC、FLAC、MP4、MOV、M4V，上传上限 1 GiB。默认最多两个解码任务，单任务限时 120 秒、输出上限 4 GiB，并保留 512 MiB 磁盘余量；超限、超时和解码失败都会清理临时文件。文件音源只能引用通过媒体接口导入的 UUID WAV，不能提交任意本地路径。实际可解码范围仍受 macOS 解码器支持限制。
 - 现有 Hy-SimulMT `llama-mtmd-cli --stream-v2` 常驻进程接入。
 - 上下文达到 65% 后在空白回合轮换，达到 80% 时强制轮换；仅携带最近 4 轮双语短上下文。正常轮换在进程内完成，不支持进程内轮换时才重启；翻译方向切换会重启当前模型进程并重置语言上下文。
 - 轮换与异常恢复会重放已写入但尚未确认的音频，进程内片段 ID 保持连续。
 - 双语字幕事件、`AVSpeechSynthesizer` 合成与独立原生播放器；三档策略同时作用于组句和播放队列。
 - 本地 Web 控制台和独立 macOS WKWebView 窗口。
+- **本机控制面安全**：Core 只接受数字 loopback 监听地址；每次启动生成 256-bit token 和 instance ID，写入权限为 `0600` 的 `runtime/bootstrap.json`。REST/下载/上传使用 Bearer，WebSocket 校验 Origin 并要求首条消息认证；Host/Origin 采用精确 allowlist，token 不进入 query string 或 Core 日志。模型、播放器、runtime 和缓存路径属于启动期部署配置，普通会话 API 无法指定。
 
 ## 构建与运行
 
@@ -40,7 +41,7 @@ cargo test --workspace
 ./run.sh
 ```
 
-正式控制台默认位于 `http://127.0.0.1:8780`。其他启动方式：
+正式控制台默认位于 `http://127.0.0.1:8780`。`run.sh` 会把带 `#auth=` 的启动 URL 交给桌面壳；`--no-open` 和 `npm run dev` 会在终端输出该 URL。浏览器将 token 保存到当前标签页的 `sessionStorage` 后立即清除 fragment，刷新继续使用；Core 重启后需使用新的启动 URL。直接启动 Core 的自动化客户端可从其独立 runtime 的 `bootstrap.json` 读取 URL 和 token，不要把该文件或启动 URL 发到不可信环境。其他启动方式：
 
 ```bash
 ./run.sh --no-open
@@ -76,13 +77,14 @@ npm run dev -- --host 127.0.0.1 --port 7100
 - 进程采集无法区分同一浏览器中的多个标签页。
 - 本地媒体按文件方式送入实时链路，不是带画面、可随意拖动的视频播放器。
 - 导出音频只包含译文配音，不是嵌入原视频的混流成品；模拟播放器不会生成可导出的语音 WAV。三种导出都固定同一 SQLite 只读事务中的字幕 revision 和语音清单快照；VTT 正确转义文本实体，WAV 以 64 KiB 缓冲流式拼接 PCM16、校验后原子发布。缺失、失败、未完成、截断、格式不一致或导出期间被修改的片段会明确报错，不会静默生成不完整结果。
-- HTTP 控制接口仅监听本机，尚未实现远程访问认证。
+- HTTP 控制接口仅监听本机并实施启动 token、Host/Origin 校验；远程访问仍不支持，非 loopback 配置会直接拒绝启动。当前桌面壳通过环境变量接收启动 URL，后续签名应用将改用继承 pipe 握手。
 
 ## 验证
 
 ```bash
 cargo test --workspace --locked
 python3 tests/pipeline/acceptance_echonote.py  # 自行启动隔离 Core，使用 mock 链路
+python3 tests/pipeline/security_boundary.py   # 认证、来源、路径和非 loopback 负向验收
 npm install
 npx playwright install --no-shell chromium
 npm run test:browser                    # 独立 Core + Chromium 浏览器验收

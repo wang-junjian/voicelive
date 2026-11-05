@@ -389,6 +389,8 @@ impl RunningTranslator for HyTranslator {
 
 pub async fn start_translator(
     config: &TranslatorConfig,
+    model_executable: &Path,
+    model_path: &Path,
     session_id: Uuid,
     epoch: u64,
     sender: mpsc::Sender<TranslatorSignal>,
@@ -407,15 +409,13 @@ pub async fn start_translator(
             }))
         }
         TranslatorConfig::HySimulmt {
-            executable,
-            model,
             direction,
             context,
             n_predict,
         } => {
             let config = HyConfig {
-                executable: executable.clone(),
-                model: model.clone(),
+                executable: model_executable.to_string_lossy().into_owned(),
+                model: model_path.to_string_lossy().into_owned(),
                 direction: direction.clone(),
                 context: context.unwrap_or(16_384),
                 n_predict: n_predict.unwrap_or(160),

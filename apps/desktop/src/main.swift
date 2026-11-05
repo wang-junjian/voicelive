@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     private var window: NSWindow!
     private var webView: WKWebView!
     private var serviceURL: URL!
+    private var authToken = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let frame = NSRect(x: 0, y: 0, width: 1180, height: 820)
@@ -16,6 +17,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
 
         let address = ProcessInfo.processInfo.environment["SIMULMT_UI_URL"] ?? "http://127.0.0.1:8780"
         serviceURL = URL(string: address)
+        if let fragment = serviceURL?.fragment {
+            for component in fragment.split(separator: "&") {
+                let pair = component.split(separator: "=", maxSplits: 1)
+                if pair.count == 2 && pair[0] == "auth" {
+                    authToken = String(pair[1])
+                }
+            }
+        }
         let configuration = WKWebViewConfiguration()
         configuration.userContentController.add(self, name: "selectMedia")
         webView = WKWebView(frame: window.contentView!.bounds, configuration: configuration)
@@ -29,7 +38,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "selectMedia" else { return }
+        guard message.name == "selectMedia",
+              message.frameInfo.isMainFrame,
+              let body = message.body as? [String: Any], body.isEmpty,
+              let serviceURL,
+              message.frameInfo.securityOrigin.protocol == serviceURL.scheme,
+              message.frameInfo.securityOrigin.host == serviceURL.host,
+              message.frameInfo.securityOrigin.port == (serviceURL.port ?? 80) else { return }
         let panel = NSOpenPanel()
         panel.title = "选择要同传的音视频"
         panel.prompt = "导入"
@@ -44,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
     }
 
     private func uploadMedia(_ fileURL: URL) {
-        guard let serviceURL,
+        guard let serviceURL, !authToken.isEmpty,
               var components = URLComponents(url: serviceURL, resolvingAgainstBaseURL: false) else {
             deliverMediaResult(["error": "无法连接同传服务"])
             return
@@ -59,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKScriptMessageHandler
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(authToken)", forHTTPHeaderField: "Authorization")
         URLSession.shared.uploadTask(with: request, fromFile: fileURL) { [weak self] data, response, error in
             DispatchQueue.main.async {
                 if let error {

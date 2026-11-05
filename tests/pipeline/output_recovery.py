@@ -4,7 +4,6 @@
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import subprocess
 import tempfile
@@ -66,9 +65,9 @@ def start_decoy(runtime):
     """A same-named executable outside the Core's process group."""
     decoy = runtime / "decoy" / PLAYER.name
     decoy.parent.mkdir()
-    shutil.copy2("/bin/sleep", decoy)
     return subprocess.Popen(
         [str(decoy), "120"],
+        executable="/bin/sleep",
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -92,8 +91,6 @@ def main():
             config["translator"] = {"type": "mock"}
             config["output"] = {
                 "type": "macos_system",
-                "player_path": str(player),
-                "cache_dir": str(runtime / "cache"),
                 "voice": "Tingting",
                 "speech_rate": 220,
             }
@@ -126,7 +123,10 @@ def main():
             old_started = snapshot["metrics"]["playback_started"]
             for pid in old_pids:
                 kill_direct_player(core, player, pid)
-            assert decoy.poll() is None, "same-named decoy was killed"
+            assert decoy.poll() is None, (
+                f"same-named decoy was killed: decoy_pid={decoy.pid}, "
+                f"returncode={decoy.returncode}, player_pids={old_pids}"
+            )
 
             def recovered():
                 current = direct_player_pids(core, player)

@@ -13,7 +13,9 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
 futures-util = "0.3"
+getrandom = "0.3"
 hound = "3.5"
+libc = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

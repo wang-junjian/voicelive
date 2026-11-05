@@ -11,16 +11,21 @@ import wave
 ROOT = Path(__file__).resolve().parents[2]
 BASE = "http://127.0.0.1:8894"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TOKEN = None
 
 
 def request(path, method="GET", body=None, timeout=10):
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(BASE + path, data=data, method=method, headers={"content-type": "application/json"})
+    headers = {"content-type": "application/json"}
+    if TOKEN:
+        headers["authorization"] = f"Bearer {TOKEN}"
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
     with OPENER.open(req, timeout=timeout) as response:
         return json.load(response)
 
 
 def main():
+    global TOKEN
     runtime = ROOT / f"runtime/export-stream-{int(time.time())}"
     cache = runtime / "cache"
     cache.mkdir(parents=True)
@@ -55,11 +60,16 @@ def main():
                     time.sleep(0.25)
             else:
                 raise AssertionError("core did not start")
+            TOKEN = json.loads((runtime / "bootstrap.json").read_text())["token"]
             session = request("/api/sessions", "POST", request("/api/default-config"))
             sid = session["session_id"]
             spool = cache / f"speech-{sid}-1.wav"
             spool.write_bytes(input_path.read_bytes())
-            with OPENER.open(f"{BASE}/api/sessions/{sid}/export.wav", timeout=10) as response:
+            export_request = urllib.request.Request(
+                f"{BASE}/api/sessions/{sid}/export.wav",
+                headers={"authorization": f"Bearer {TOKEN}"},
+            )
+            with OPENER.open(export_request, timeout=10) as response:
                 exported = response.read()
                 content_length = int(response.headers["Content-Length"])
             assert content_length == len(exported), (content_length, len(exported))

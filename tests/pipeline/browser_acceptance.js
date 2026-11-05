@@ -17,12 +17,13 @@ let core;
 let browser;
 let page;
 let port;
+let token;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const api = async (route, method = "GET", body) => {
   const response = await fetch(`http://127.0.0.1:${port}${route}`, {
     method,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await response.text();
@@ -81,6 +82,7 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
     if (core.exitCode !== null) throw new Error(fs.readFileSync(logPath, "utf8"));
     try { return (await api("/api/health")).status === "ok"; } catch { return false; }
   }, "Core did not become healthy");
+  token = JSON.parse(fs.readFileSync(path.join(runtime, "bootstrap.json"), "utf8")).token;
 
   const config = await api("/api/default-config");
   config.source = { type: "mock", frames: 30 };
@@ -95,7 +97,7 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
   const errors = [];
   page.on("pageerror", error => errors.push(error.message));
   await page.setViewportSize({ width: 1440, height: 900 });
-  await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: "domcontentloaded" });
+  await page.goto(`http://127.0.0.1:${port}/#auth=${token}`, { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => document.querySelector("#sessionTitle")?.value === "秋季发布会 · 双语同传");
   assert.equal(await page.locator(".brand-name").textContent(), "声译");
   assert.equal((await page.locator(".strategy-option").allTextContents()).join("/"), "实时/均衡/保真");
@@ -134,10 +136,12 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
   assert.equal(await page.locator("#panelTitle").textContent(), "会话信息");
   assert.equal(await page.locator('[data-export]').count(), 3);
   const exportResponseEvent = page.waitForResponse(response => response.url().includes(`/api/sessions/${id}/export.srt`));
+  const exportDownloadEvent = page.waitForEvent("download");
   await page.locator('[data-export="srt"]').click();
   const exportResponse = await exportResponseEvent;
+  const exportDownload = await exportDownloadEvent;
   assert.equal(exportResponse.status(), 200);
-  assert.match(await exportResponse.text(), /-->/);
+  assert.match(fs.readFileSync(await exportDownload.path(), "utf8"), /-->/);
   assert.equal(await page.locator("#toastRegion .toast").count(), 0);
   const audioSeconds = Math.floor((await api(`/api/sessions/${id}`)).metrics.captured_duration_us / 1e6);
   const expectedAudioDuration = [Math.floor(audioSeconds / 60), audioSeconds % 60].map(value => String(value).padStart(2, "0")).join(":");

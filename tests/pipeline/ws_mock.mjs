@@ -1,8 +1,14 @@
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const token = process.env.SIMULMT_TEST_TOKEN || JSON.parse(fs.readFileSync(path.join(root, "runtime", "bootstrap.json"), "utf8")).token;
 const base = "http://127.0.0.1:8780";
 const request = async (path, method = "GET", body) => {
   const response = await fetch(base + path, {
     method,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) throw new Error(await response.text());
@@ -23,6 +29,7 @@ await new Promise((resolve, reject) => {
   ws.onerror = reject;
 });
 try {
+  ws.send(JSON.stringify({ type: "authenticate", token }));
   await request(`/api/sessions/${sid}/prepare`, "POST", {});
   await new Promise((resolve) => setTimeout(resolve, 100));
   await request(`/api/sessions/${sid}/start`, "POST", {});

@@ -181,8 +181,7 @@ impl Store {
                 sessions.push(StoredSession {
                     id: Uuid::parse_str(&id)
                         .map_err(|error| CoreError::Storage(error.to_string()))?,
-                    config: serde_json::from_str(&config)
-                        .map_err(|error| CoreError::Storage(error.to_string()))?,
+                    config: parse_stored_config(&config)?,
                     metadata: SessionMetadata {
                         title,
                         created_at_ms,
@@ -309,23 +308,19 @@ impl Store {
 
     /// Reconciles files left by a stopped/crashed player, then closes any
     /// remaining non-terminal states. No player may be running for this session.
-    pub async fn recover_speech(&self, session_id: Uuid) -> Result<()> {
+    pub async fn recover_speech(&self, session_id: Uuid, cache_dir: PathBuf) -> Result<()> {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
-            let config_json = transaction
+            if transaction
                 .query_row(
-                    "SELECT config_json FROM sessions WHERE session_id = ?1",
+                    "SELECT 1 FROM sessions WHERE session_id = ?1",
                     params![session_id.to_string()],
-                    |row| row.get::<_, String>(0),
+                    |_| Ok(()),
                 )
-                .optional()?;
-            let Some(config_json) = config_json else {
-                return Ok(());
-            };
-            let config: PipelineConfig = serde_json::from_str(&config_json)
-                .map_err(|error| CoreError::Storage(error.to_string()))?;
-            if let OutputConfig::MacosSystem { cache_dir, .. } = config.output {
-                reconcile_speech_directory(&transaction, session_id, Path::new(&cache_dir))?;
+                .optional()?
+                .is_some()
+            {
+                reconcile_speech_directory(&transaction, session_id, &cache_dir)?;
             }
             transaction.execute(
                 "UPDATE speech_segments SET status = 'cancelled'
@@ -353,6 +348,37 @@ impl Store {
         })
         .await
     }
+}
+
+fn strip_legacy_deployment_fields(value: &mut serde_json::Value) {
+    let config = match value.get_mut("config") {
+        Some(config) => config,
+        None => value,
+    };
+    for component in ["translator", "output"] {
+        if let Some(object) = config
+            .get_mut(component)
+            .and_then(|item| item.as_object_mut())
+        {
+            for field in ["executable", "model", "player_path", "cache_dir"] {
+                object.remove(field);
+            }
+        }
+    }
+}
+
+fn parse_stored_config(contents: &str) -> Result<PipelineConfig> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(contents).map_err(|error| CoreError::Storage(error.to_string()))?;
+    strip_legacy_deployment_fields(&mut value);
+    serde_json::from_value(value).map_err(|error| CoreError::Storage(error.to_string()))
+}
+
+fn parse_stored_session(contents: &str) -> Result<StoredSession> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(contents).map_err(|error| CoreError::Storage(error.to_string()))?;
+    strip_legacy_deployment_fields(&mut value);
+    serde_json::from_value(value).map_err(|error| CoreError::Storage(error.to_string()))
 }
 
 fn upsert_session(connection: &Connection, stored: &StoredSession, update: bool) -> Result<()> {
@@ -576,10 +602,8 @@ fn migrate_legacy_sync(connection: &Connection, runtime_dir: &Path) -> Result<()
         }
         let stored = match fs::read_to_string(&manifest)
             .map_err(CoreError::from)
-            .and_then(|contents| {
-                serde_json::from_str::<StoredSession>(&contents)
-                    .map_err(|error| CoreError::Storage(error.to_string()))
-            }) {
+            .and_then(|contents| parse_stored_session(&contents))
+        {
             Ok(stored) => stored,
             Err(error) => {
                 tracing::warn!(path = %manifest.display(), "ignored invalid legacy session: {error}");
@@ -588,7 +612,7 @@ fn migrate_legacy_sync(connection: &Connection, runtime_dir: &Path) -> Result<()
         };
         upsert_session(connection, &stored, false)?;
         migrate_subtitles(connection, runtime_dir, stored.id)?;
-        migrate_speech(connection, &stored)?;
+        migrate_speech(connection, &stored, runtime_dir)?;
     }
     Ok(())
 }
@@ -768,11 +792,15 @@ fn validate_wav(path: &Path) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn migrate_speech(connection: &Connection, stored: &StoredSession) -> Result<()> {
-    let OutputConfig::MacosSystem { cache_dir, .. } = &stored.config.output else {
+fn migrate_speech(
+    connection: &Connection,
+    stored: &StoredSession,
+    runtime_dir: &Path,
+) -> Result<()> {
+    if !matches!(stored.config.output, OutputConfig::MacosSystem { .. }) {
         return Ok(());
-    };
-    let directory = PathBuf::from(cache_dir);
+    }
+    let directory = runtime_dir.join("cache");
     let mut paths = match fs::read_dir(&directory) {
         Ok(entries) => entries
             .filter_map(std::result::Result::ok)
@@ -935,8 +963,6 @@ mod tests {
             id: session_id,
             config: PipelineConfig {
                 output: OutputConfig::MacosSystem {
-                    player_path: "unused".into(),
-                    cache_dir: cache.to_string_lossy().into_owned(),
                     voice: None,
                     speech_rate: None,
                 },
@@ -954,7 +980,17 @@ mod tests {
         let history = runtime
             .join("subtitles")
             .join(format!("{session_id}.jsonl"));
-        let original_manifest = serde_json::to_vec_pretty(&stored).unwrap();
+        let mut legacy_manifest = serde_json::to_value(&stored).unwrap();
+        for (component, fields) in [
+            ("translator", ["executable", "model"]),
+            ("output", ["player_path", "cache_dir"]),
+        ] {
+            for field in fields {
+                legacy_manifest["config"][component][field] =
+                    serde_json::Value::String("/legacy/privileged/path".into());
+            }
+        }
+        let original_manifest = serde_json::to_vec_pretty(&legacy_manifest).unwrap();
         fs::write(&manifest, &original_manifest).unwrap();
         let lines = [
             serde_json::to_string(&cue("cue-0", 1, 0, "first draft")).unwrap(),
@@ -971,6 +1007,13 @@ mod tests {
 
         let store = Store::open(runtime).unwrap();
         store.migrate_legacy(runtime.to_path_buf()).await.unwrap();
+        let restored = store.load_sessions().await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(
+            !serde_json::to_string(&restored[0].config)
+                .unwrap()
+                .contains("/legacy/privileged/path")
+        );
         let first = store.history(session_id).await.unwrap();
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].source_text, "first final");
@@ -1027,14 +1070,14 @@ mod tests {
     async fn recovery_reconciles_crash_left_wav_and_closes_pending_rows() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(root.path()).unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
         let id = Uuid::new_v4();
         store
             .save_session(StoredSession {
                 id,
                 config: PipelineConfig {
                     output: OutputConfig::MacosSystem {
-                        player_path: "unused".into(),
-                        cache_dir: root.path().to_string_lossy().into_owned(),
                         voice: None,
                         speech_rate: None,
                     },
@@ -1050,11 +1093,11 @@ mod tests {
             })
             .await
             .unwrap();
-        write_wav(&root.path().join(format!("speech-{id}-7.wav")));
+        write_wav(&cache.join(format!("speech-{id}-7.wav")));
         store
             .record_playback(
                 id,
-                root.path().to_path_buf(),
+                cache.clone(),
                 PlaybackEvent {
                     event_type: PlaybackEventType::Queued,
                     segment_id: "pending".into(),
@@ -1066,7 +1109,7 @@ mod tests {
             )
             .await
             .unwrap();
-        store.recover_speech(id).await.unwrap();
+        store.recover_speech(id, cache).await.unwrap();
         let speech = store.speech_segments(id).await.unwrap();
         assert_eq!(speech.len(), 2);
         assert_eq!(speech[0].token, 7);

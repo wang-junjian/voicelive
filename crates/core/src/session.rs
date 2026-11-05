@@ -1,7 +1,7 @@
 use crate::error::{CoreError, Result};
 use crate::export::SubtitleExportFormat;
 use crate::lifecycle::Lifecycle;
-use crate::output::{OutputRunner, OutputSignal, PlaybackControl};
+use crate::output::{OutputPaths, OutputRunner, OutputSignal, PlaybackControl};
 use crate::source::RunningSource;
 use crate::source::{SourceEvent, SourceStartOptions, start_source};
 use crate::store::{SessionMetadata, Store, StoredSession};
@@ -19,10 +19,24 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Default)]
+pub struct DeploymentConfig {
+    pub model_executable: PathBuf,
+    pub model_path: PathBuf,
+    pub player_path: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct CoreOptions {
     pub audio_host: String,
     pub runtime_dir: String,
+    pub deployment: DeploymentConfig,
+}
+
+impl CoreOptions {
+    pub fn cache_dir(&self) -> PathBuf {
+        PathBuf::from(&self.runtime_dir).join("cache")
+    }
 }
 
 pub struct SessionManager {
@@ -58,7 +72,7 @@ impl SessionManager {
         };
         let stored_sessions = store.load_sessions().await?;
         for stored in &stored_sessions {
-            store.recover_speech(stored.id).await?;
+            store.recover_speech(stored.id, options.cache_dir()).await?;
         }
         let mut restored = stored_sessions
             .into_iter()
@@ -584,6 +598,8 @@ impl Session {
                 "starting the translator process",
                 start_translator(
                     &config.translator,
+                    &self.options.deployment.model_executable,
+                    &self.options.deployment.model_path,
                     self.id,
                     epoch,
                     sender,
@@ -703,6 +719,10 @@ impl Session {
                 "starting the output process",
                 OutputRunner::start(
                     &config.output,
+                    OutputPaths {
+                        player_path: &self.options.deployment.player_path,
+                        cache_dir: &self.options.cache_dir(),
+                    },
                     config.latency_mode,
                     self.id,
                     epoch,
@@ -887,7 +907,11 @@ impl Session {
                 Err(_) => cleanup_error = Some("output stop timed out".into()),
             }
         }
-        if let Err(error) = self.store.recover_speech(self.id).await {
+        if let Err(error) = self
+            .store
+            .recover_speech(self.id, self.options.cache_dir())
+            .await
+        {
             cleanup_error = Some(error.to_string());
         }
         self.playback.lock().await.clear();
@@ -990,7 +1014,11 @@ impl Session {
                 }
             }
         }
-        if let Err(error) = self.store.recover_speech(self.id).await {
+        if let Err(error) = self
+            .store
+            .recover_speech(self.id, self.options.cache_dir())
+            .await
+        {
             cleanup_error = Some(error.to_string());
         }
         self.playback.lock().await.clear();
@@ -1160,7 +1188,11 @@ impl Session {
             if let Some(output) = old_output.as_mut() {
                 let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
             }
-            if let Err(error) = self.store.recover_speech(self.id).await {
+            if let Err(error) = self
+                .store
+                .recover_speech(self.id, self.options.cache_dir())
+                .await
+            {
                 self.fault("speech_storage", error.to_string(), true).await;
                 return Err(error);
             }
@@ -1180,6 +1212,10 @@ impl Session {
                     "restarting the output process",
                     OutputRunner::start(
                         &config.output,
+                        OutputPaths {
+                            player_path: &self.options.deployment.player_path,
+                            cache_dir: &self.options.cache_dir(),
+                        },
                         config.latency_mode,
                         self.id,
                         epoch,
@@ -1314,26 +1350,18 @@ impl Session {
                 Err(error) => return Err(error.into()),
             }
         }
-        let cache = match &*self.config.read().await {
-            PipelineConfig {
-                output: OutputConfig::MacosSystem { cache_dir, .. },
-                ..
-            } => Some(PathBuf::from(cache_dir)),
-            _ => None,
+        let cache = self.options.cache_dir();
+        let mut entries = match tokio::fs::read_dir(cache).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.store.delete_session(self.id).await;
+            }
+            Err(error) => return Err(error.into()),
         };
-        if let Some(cache) = cache {
-            let mut entries = match tokio::fs::read_dir(cache).await {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return self.store.delete_session(self.id).await;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            let marker = self.id.to_string();
-            while let Some(entry) = entries.next_entry().await? {
-                if entry.file_name().to_string_lossy().contains(&marker) {
-                    let _ = tokio::fs::remove_file(entry.path()).await;
-                }
+        let marker = self.id.to_string();
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_name().to_string_lossy().contains(&marker) {
+                let _ = tokio::fs::remove_file(entry.path()).await;
             }
         }
         self.store.delete_session(self.id).await
@@ -1405,17 +1433,18 @@ impl Session {
     }
 
     pub async fn export_wav(&self) -> Result<PathBuf> {
-        let cache_dir = match &*self.config.read().await {
+        if !matches!(
+            &*self.config.read().await,
             PipelineConfig {
-                output: OutputConfig::MacosSystem { cache_dir, .. },
+                output: OutputConfig::MacosSystem { .. },
                 ..
-            } => PathBuf::from(cache_dir),
-            _ => {
-                return Err(CoreError::InvalidConfig(
-                    "mock output does not create audio files".into(),
-                ));
             }
-        };
+        ) {
+            return Err(CoreError::InvalidConfig(
+                "mock output does not create audio files".into(),
+            ));
+        }
+        let cache_dir = self.options.cache_dir();
         let segments = self.store.export_snapshot(self.id).await?.speech_segments;
         crate::export::export_wav(self.id, segments, cache_dir).await
     }
@@ -1704,13 +1733,7 @@ async fn forward_output(
         match signal {
             OutputSignal::Playback(event) => {
                 if event.token != 0 {
-                    let cache_dir = match &*session.config.read().await {
-                        PipelineConfig {
-                            output: OutputConfig::MacosSystem { cache_dir, .. },
-                            ..
-                        } => PathBuf::from(cache_dir),
-                        _ => PathBuf::from(&session.options.runtime_dir).join("cache"),
-                    };
+                    let cache_dir = session.options.cache_dir();
                     match session
                         .store
                         .record_playback(session.id, cache_dir, event.clone())
@@ -2197,6 +2220,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: "/tmp".into(),
+                deployment: DeploymentConfig::default(),
             },
         );
         let session = Arc::new(session);
@@ -2263,6 +2287,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         let mut prepares = tokio::task::JoinSet::new();
@@ -2345,6 +2370,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -2412,6 +2438,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.prepare().await.unwrap();
@@ -2445,6 +2472,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         *session.state.lock().await = SessionState::Preparing;
@@ -2467,6 +2495,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.prepare().await.unwrap();
@@ -2491,6 +2520,7 @@ mod tests {
         let manager = SessionManager::new(CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
+            deployment: DeploymentConfig::default(),
         });
         let first = manager.create(PipelineConfig::default()).await.unwrap();
         manager.prepare(first.id).await.unwrap();
@@ -2552,6 +2582,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         *session.runtime.lock().await = Some(Runtime {
@@ -2591,6 +2622,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.prepare().await.unwrap();
@@ -2653,6 +2685,7 @@ mod tests {
         let manager = Arc::new(SessionManager::new(CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
+            deployment: DeploymentConfig::default(),
         }));
         let first = manager.create(PipelineConfig::default()).await.unwrap();
         let second = manager.create(PipelineConfig::default()).await.unwrap();
@@ -2691,6 +2724,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.prepare().await.unwrap();
@@ -2764,6 +2798,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         *session.state.lock().await = SessionState::Running;
@@ -2830,6 +2865,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.prepare().await.unwrap();
@@ -2898,6 +2934,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.persist().await.unwrap();
@@ -2984,6 +3021,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.persist().await.unwrap();
@@ -3009,6 +3047,7 @@ mod tests {
         let options = CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.path().to_string_lossy().into_owned(),
+            deployment: DeploymentConfig::default(),
         };
         let session = Session::new(PipelineConfig::default(), options.clone());
         session
@@ -3062,8 +3101,6 @@ mod tests {
         let session = Arc::new(Session::new(
             PipelineConfig {
                 translator: TranslatorConfig::HySimulmt {
-                    executable: executable.to_string_lossy().into_owned(),
-                    model: model.to_string_lossy().into_owned(),
                     direction: "en-zh".into(),
                     context: Some(16_384),
                     n_predict: Some(160),
@@ -3073,6 +3110,11 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig {
+                    model_executable: executable,
+                    model_path: model,
+                    player_path: PathBuf::new(),
+                },
             },
         ));
         session.prepare().await.unwrap();
@@ -3098,6 +3140,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         ));
         session.prepare().await.unwrap();
@@ -3153,6 +3196,7 @@ mod tests {
         let manager = SessionManager::new(CoreOptions {
             audio_host: "unused".into(),
             runtime_dir: root.to_string_lossy().into_owned(),
+            deployment: DeploymentConfig::default(),
         });
         let first = manager.create(PipelineConfig::default()).await.unwrap();
         manager.prepare(first.id).await.unwrap();
@@ -3198,6 +3242,7 @@ mod tests {
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.to_string_lossy().into_owned(),
+                deployment: DeploymentConfig::default(),
             },
         );
         for index in 0..600 {

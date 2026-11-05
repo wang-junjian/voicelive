@@ -64,15 +64,17 @@ def terminate_process(process):
 class CoreProcess:
     """A Core listening on a random port in its own process group."""
 
-    def __init__(self, root, runtime, binary):
+    def __init__(self, root, runtime, binary, environment=None):
         self.root = Path(root)
         self.runtime = Path(runtime)
         self.binary = Path(binary)
+        self.environment = environment or {}
         self.port = free_port()
         self.base = f"http://127.0.0.1:{self.port}"
         self.process = None
         self.pgid = None
         self.log = None
+        self.token = None
 
     @property
     def pid(self):
@@ -82,11 +84,14 @@ class CoreProcess:
 
     def request(self, path, method="GET", body=None, timeout=20):
         data = None if body is None else json.dumps(body).encode()
+        headers = {"content-type": "application/json"}
+        if self.token:
+            headers["authorization"] = f"Bearer {self.token}"
         req = urllib.request.Request(
             self.base + path,
             data=data,
             method=method,
-            headers={"content-type": "application/json"},
+            headers=headers,
         )
         try:
             with OPENER.open(req, timeout=timeout) as response:
@@ -105,12 +110,14 @@ class CoreProcess:
         self.runtime.mkdir(parents=True, exist_ok=True)
         log_path = self.runtime / "core.log"
         self.log = log_path.open("ab")
+        self.token = None
         env = os.environ.copy()
         env.update(
             SIMULMT_ROOT=str(self.root),
             SIMULMT_RUNTIME_DIR=str(self.runtime),
             SIMULMT_ADDR=f"127.0.0.1:{self.port}",
         )
+        env.update(self.environment)
         try:
             self.process = subprocess.Popen(
                 [str(self.binary)],
@@ -132,6 +139,8 @@ class CoreProcess:
             try:
                 health = self.request("/api/health", timeout=1)
                 if health is not None and health["status"] == "ok":
+                    bootstrap = json.loads((self.runtime / "bootstrap.json").read_text())
+                    self.token = bootstrap["token"]
                     return self
             except Exception:
                 time.sleep(0.1)
@@ -163,3 +172,4 @@ class CoreProcess:
             self.process = None
             self.pgid = None
             self.log = None
+            self.token = None

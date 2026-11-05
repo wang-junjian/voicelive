@@ -1,18 +1,25 @@
-use axum::body::{Body, Bytes};
+mod auth;
+mod bootstrap;
+mod media;
+
+use auth::{LocalAuth, authorize, security_error};
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Json, Router, middleware};
 use serde::{Deserialize, Serialize};
 use simulmt_api::*;
 use simulmt_core::{
-    CoreError, CoreOptions, SessionManager, SubtitleExportFormat, list_macos_sources,
+    CoreError, CoreOptions, DeploymentConfig, SessionManager, SubtitleExportFormat,
+    list_macos_sources,
 };
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -20,14 +27,10 @@ use uuid::Uuid;
 struct AppState {
     manager: Arc<SessionManager>,
     audio_host: String,
-    paths: ProjectPaths,
-}
-
-#[derive(Clone)]
-struct ProjectPaths {
-    root: PathBuf,
-    demo: PathBuf,
-    runtime: PathBuf,
+    runtime_dir: PathBuf,
+    media_limits: media::MediaLimits,
+    media_gate: Arc<Semaphore>,
+    auth: LocalAuth,
 }
 
 #[derive(Serialize)]
@@ -44,6 +47,14 @@ async fn main() {
                 .unwrap_or_else(|_| "simulmt_app=info,simulmt_core=info".into()),
         )
         .init();
+    let address = std::env::var("SIMULMT_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8780".into())
+        .parse::<std::net::SocketAddr>()
+        .expect("SIMULMT_ADDR must be a numeric loopback IP and port");
+    if !address.ip().is_loopback() {
+        panic!("SIMULMT_ADDR must be loopback; remote control-plane access is disabled");
+    }
+    let media_limits = media::MediaLimits::from_env().expect("valid media resource limits");
     let root = std::env::var("SIMULMT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().expect("current directory"));
@@ -73,23 +84,35 @@ async fn main() {
         SessionManager::load(CoreOptions {
             audio_host: audio_host.clone(),
             runtime_dir: runtime.to_string_lossy().into_owned(),
+            deployment: DeploymentConfig {
+                model_executable: demo.join("llama.cpp-hyv3/build/bin/llama-mtmd-cli"),
+                model_path: demo.join("models/Hy-SimulMT-30B-A3B-Interleave-Q4_K_M.gguf"),
+                player_path: root.join("target/native/simulmt-tts-host"),
+            },
         })
         .await
         .expect("restore local sessions"),
     );
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("bind local API");
+    let identity = bootstrap::publish(&runtime, address).expect("publish owner-only bootstrap");
+    let auth = LocalAuth::new(address, identity.token.clone());
     let state = AppState {
         manager: Arc::clone(&manager),
         audio_host,
-        paths: ProjectPaths {
-            root: root.clone(),
-            demo,
-            runtime,
-        },
+        runtime_dir: runtime,
+        media_gate: Arc::new(Semaphore::new(media_limits.concurrency)),
+        media_limits,
+        auth: auth.clone(),
     };
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sources", get(sources))
-        .route("/api/media", post(import_media))
+        .route(
+            "/api/media",
+            post(import_media).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/default-config", get(default_config))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(
@@ -117,12 +140,9 @@ async fn main() {
         .route("/api/sessions/{id}/ws", get(websocket))
         .fallback_service(ServeDir::new(&web).fallback(ServeFile::new(web.join("index.html"))))
         .with_state(state)
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024));
-    let address = std::env::var("SIMULMT_ADDR").unwrap_or_else(|_| "127.0.0.1:8780".into());
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .expect("bind local API");
-    tracing::info!("SimulMT listening on http://{address}");
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn_with_state(auth, authorize));
+    tracing::info!("EchoNote listening on http://{address}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
@@ -161,103 +181,44 @@ struct MediaUploadQuery {
     name: Option<String>,
 }
 
-#[derive(Serialize)]
-struct ImportedMedia {
-    name: String,
-    path: String,
-}
-
 async fn import_media(
     State(state): State<AppState>,
     Query(query): Query<MediaUploadQuery>,
-    body: Bytes,
-) -> Result<Json<ImportedMedia>, ApiError> {
-    if body.is_empty() {
-        return Err(CoreError::InvalidConfig("the selected media file is empty".into()).into());
-    }
-    let name = query.name.unwrap_or_else(|| "local-media.wav".into());
-    let extension = std::path::Path::new(&name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("wav")
-        .to_ascii_lowercase();
-    let supported = ["wav", "mp3", "m4a", "aac", "flac", "mp4", "mov", "m4v"];
-    if !supported.contains(&extension.as_str()) {
-        return Err(CoreError::InvalidConfig(format!(
-            "unsupported media format .{extension}; use WAV, MP3, M4A, AAC, FLAC, MP4, MOV or M4V"
-        ))
-        .into());
-    }
-    let directory = state.paths.runtime.join("media");
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .map_err(CoreError::from)?;
-    let stem = Uuid::new_v4().to_string();
-    let input = directory.join(format!("{stem}-input.{extension}"));
-    let output = directory.join(format!("{stem}.wav"));
-    tokio::fs::write(&input, body)
-        .await
-        .map_err(CoreError::from)?;
-    let converted = tokio::process::Command::new("/usr/bin/afconvert")
-        .arg("-f")
-        .arg("WAVE")
-        .arg("-d")
-        .arg("LEI16@16000")
-        .arg("-c")
-        .arg("1")
-        .arg(&input)
-        .arg(&output)
-        .output()
-        .await
-        .map_err(|error| CoreError::Source(format!("failed to start media decoder: {error}")))?;
-    if !converted.status.success() {
-        let _ = tokio::fs::remove_file(&input).await;
-        let _ = tokio::fs::remove_file(&output).await;
-        return Err(CoreError::InvalidConfig(format!(
-            "cannot decode this media file: {}",
-            String::from_utf8_lossy(&converted.stderr).trim()
-        ))
-        .into());
-    }
-    Ok(Json(ImportedMedia {
-        name,
-        path: output.to_string_lossy().into_owned(),
-    }))
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<media::ImportedMedia>, Response> {
+    let _permit = Arc::clone(&state.media_gate)
+        .try_acquire_owned()
+        .map_err(|_| {
+            security_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "media_decoder_busy",
+                "the media decoder concurrency limit has been reached; retry later",
+            )
+        })?;
+    media::import(
+        &state.runtime_dir,
+        query.name,
+        headers,
+        body,
+        state.media_limits,
+    )
+    .await
+    .map(Json)
 }
 
-async fn default_config(State(state): State<AppState>) -> Json<PipelineConfig> {
-    let demo = &state.paths.demo;
+async fn default_config() -> Json<PipelineConfig> {
     Json(PipelineConfig {
         source: SourceConfig::MacosSystem {
             exclude_pids: vec![],
             mute_original: true,
         },
         translator: TranslatorConfig::HySimulmt {
-            executable: demo
-                .join("llama.cpp-hyv3/build/bin/llama-mtmd-cli")
-                .to_string_lossy()
-                .into_owned(),
-            model: demo
-                .join("models/Hy-SimulMT-30B-A3B-Interleave-Q4_K_M.gguf")
-                .to_string_lossy()
-                .into_owned(),
             direction: "en-zh".into(),
             context: Some(16_384),
             n_predict: Some(160),
         },
         output: OutputConfig::MacosSystem {
-            player_path: state
-                .paths
-                .root
-                .join("target/native/simulmt-tts-host")
-                .to_string_lossy()
-                .into_owned(),
-            cache_dir: state
-                .paths
-                .runtime
-                .join("cache")
-                .to_string_lossy()
-                .into_owned(),
             voice: Some("Tingting".into()),
             // Synthesize near natural speed; playback fits each phrase to its
             // source duration and only adds catch-up when real backlog exists.
@@ -269,10 +230,39 @@ async fn default_config(State(state): State<AppState>) -> Json<PipelineConfig> {
     })
 }
 
+fn validate_public_config(config: &PipelineConfig, runtime_dir: &FsPath) -> Result<(), ApiError> {
+    validate_public_source(&config.source, runtime_dir)
+}
+
+fn validate_public_source(source: &SourceConfig, runtime_dir: &FsPath) -> Result<(), ApiError> {
+    let SourceConfig::File { path, .. } = source else {
+        return Ok(());
+    };
+    let media_root = std::fs::canonicalize(runtime_dir.join("media")).map_err(|_| {
+        CoreError::InvalidConfig("import media before selecting a file source".into())
+    })?;
+    let candidate = std::fs::canonicalize(path).map_err(|_| {
+        CoreError::InvalidConfig("the selected media is no longer available".into())
+    })?;
+    let valid_name = candidate
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        && candidate.extension().and_then(|value| value.to_str()) == Some("wav");
+    if candidate.parent() != Some(media_root.as_path()) || !valid_name || !candidate.is_file() {
+        return Err(CoreError::InvalidConfig(
+            "file sources must reference a WAV imported through /api/media".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 async fn create_session(
     State(state): State<AppState>,
     Json(config): Json<PipelineConfig>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
+    validate_public_config(&config, &state.runtime_dir)?;
     let session = state.manager.create(config).await?;
     Ok(Json(session.snapshot().await))
 }
@@ -322,6 +312,7 @@ async fn reconfigure(
     Json(config): Json<PipelineConfig>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
     let session = state.manager.get(id).await?;
+    validate_public_config(&config, &state.runtime_dir)?;
     session.reconfigure(config).await?;
     Ok(Json(session.snapshot().await))
 }
@@ -391,6 +382,7 @@ async fn set_source(
     Json(selection): Json<SourceSelection>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
     let session = state.manager.get(id).await?;
+    validate_public_source(&selection.source, &state.runtime_dir)?;
     session
         .set_source(selection.source, selection.mute_original)
         .await?;
@@ -533,13 +525,47 @@ async fn websocket(
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let session = state.manager.get(id).await?;
-    Ok(ws.on_upgrade(move |socket| stream_events(socket, session.subscribe())))
+    let auth = state.auth.clone();
+    Ok(ws
+        .max_message_size(4 * 1024)
+        .max_frame_size(4 * 1024)
+        .on_upgrade(move |socket| stream_events(socket, session.subscribe(), auth)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SocketAuthentication {
+    #[serde(rename = "type")]
+    kind: String,
+    token: String,
 }
 
 async fn stream_events(
     mut socket: WebSocket,
     mut events: tokio::sync::broadcast::Receiver<SessionEvent>,
+    auth: LocalAuth,
 ) {
+    let authenticated = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv())
+        .await
+        .ok()
+        .flatten()
+        .and_then(Result::ok)
+        .and_then(|message| match message {
+            Message::Text(text) => serde_json::from_str::<SocketAuthentication>(&text).ok(),
+            _ => None,
+        })
+        .is_some_and(|authentication| {
+            authentication.kind == "authenticate" && auth.accepts_token(&authentication.token)
+        });
+    if !authenticated {
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1008,
+                reason: "valid first-message authentication required".into(),
+            })))
+            .await;
+        return;
+    }
     loop {
         match events.recv().await {
             Ok(event) => {
