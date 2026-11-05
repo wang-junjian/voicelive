@@ -1,14 +1,21 @@
-const assert = require("node:assert/strict");
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const net = require("node:net");
-const path = require("node:path");
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright";
 
-const root = path.join(__dirname, "..", "..");
-const runtime = fs.mkdtempSync(path.join(root, "runtime", "browser-acceptance-"));
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+
+async function main() {
+const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "echonote-browser-acceptance-"));
 const logPath = path.join(runtime, "core.log");
 const log = fs.openSync(logPath, "a");
 let core;
+let browser;
+let page;
 let port;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -42,6 +49,16 @@ const layout = async () => page.evaluate(() => ({
 }));
 
 try {
+const binary = path.join(root, "target", "debug", "simulmt-app");
+const build = spawnSync("cargo", ["build", "--package", "simulmt-app", "--locked"], {
+  cwd: root,
+  stdio: "inherit",
+});
+if (build.status !== 0) throw new Error("cargo build --package simulmt-app --locked failed");
+browser = await chromium.launch({ headless: true, channel: "chromium" });
+page = await browser.newPage();
+fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
+
   port = await new Promise((resolve, reject) => {
     const server = net.createServer();
     server.once("error", reject);
@@ -50,7 +67,7 @@ try {
       server.close(() => resolve(value));
     });
   });
-  core = spawn(path.join(root, "target/debug/simulmt-app"), [], {
+  core = spawn(binary, [], {
     cwd: root,
     env: {
       ...process.env,
@@ -99,7 +116,10 @@ try {
   await waitFor(async () => (await api(`/api/sessions/${id}`)).state === "paused", "UI did not pause");
 
   await page.locator("#sessionTitle").fill("产品验收 · 回响");
+  const renameResponseEvent = page.waitForResponse(response => response.url().includes(`/api/sessions/${id}/title`));
   await page.locator("#sessionTitle").press("Enter");
+  const renameResponse = await renameResponseEvent;
+  assert.equal(renameResponse.status(), 200, await renameResponse.text());
   await page.waitForFunction(() => document.querySelector(".session-item-title")?.textContent === "产品验收 · 回响");
   await page.locator('#strategyControl [data-policy="complete"]').click();
   await page.waitForFunction(() => localStorage.getItem("echonote.policy") === "complete");
@@ -145,15 +165,13 @@ try {
 
   await page.locator("#newSession").click();
   await page.waitForFunction(() => document.querySelector("#sessionTotal")?.textContent === "02");
-  await waitFor(async () => {
-    const current = await page.evaluate(() => localStorage.getItem("echonote.session"));
-    return current && (await api(`/api/sessions/${current}`)).state === "ready";
-  }, "resident model was not moved to the new session");
   const secondId = await page.evaluate(() => localStorage.getItem("echonote.session"));
-  assert.equal((await api(`/api/sessions/${id}`)).state, "idle");
+  assert.equal((await api(`/api/sessions/${secondId}`)).state, "idle");
+  assert.equal((await api(`/api/sessions/${id}`)).state, "paused");
 
   await page.locator("#playToggle").click();
-  await waitFor(async () => (await api(`/api/sessions/${secondId}`)).state === "running", "new session did not continue");
+  await waitFor(async () => (await api(`/api/sessions/${secondId}`)).state === "running", "new session did not start explicitly");
+  assert.equal((await api(`/api/sessions/${id}`)).state, "idle");
   await page.locator("#sourceButton").click();
   await page.waitForSelector('[data-source-choice="system"]');
   assert.equal(await page.locator('[data-source-choice="microphone"]').count(), 1);
@@ -188,12 +206,14 @@ try {
   await page.waitForFunction(() => document.querySelector("#sessionTitle")?.value === "本地验收.wav");
   await page.waitForFunction(() => document.querySelector("#sessionTotal")?.textContent === "03");
   const mediaId = await page.evaluate(() => localStorage.getItem("echonote.session"));
-  await waitFor(async () => {
-    const snapshot = await api(`/api/sessions/${mediaId}`);
-    return snapshot.state === "running" && snapshot.config.source.type === "file";
-  }, "media import did not automatically continue interpretation");
-  assert.equal((await api(`/api/sessions/${secondId}`)).state, "idle");
+  let snapshot = await api(`/api/sessions/${mediaId}`);
+  assert.equal(snapshot.state, "idle");
+  assert.equal(snapshot.config.source.type, "file");
+  assert.equal((await api(`/api/sessions/${secondId}`)).state, "running");
   assert.equal(await page.locator("#sourceName").textContent(), "本地验收.wav");
+  await page.locator("#playToggle").click();
+  await waitFor(async () => (await api(`/api/sessions/${mediaId}`)).state === "running", "media session did not start explicitly");
+  assert.equal((await api(`/api/sessions/${secondId}`)).state, "idle");
   await page.locator("#playToggle").click();
   await waitFor(async () => (await api(`/api/sessions/${mediaId}`)).state === "paused", "media session did not pause");
   assert.equal(await page.locator("#toastRegion .toast").count(), 0);
@@ -243,13 +263,14 @@ try {
     create_delete: true,
     model_handoff: true,
     media_file_chooser: true,
-    media_auto_resume: true,
+    media_explicit_start: true,
     success_toasts_suppressed: true,
     layouts: { desktop, tablet, mobile },
     javascript_errors: errors,
     real_audio_or_model: false,
   };
 } finally {
+  if (browser) await browser.close();
   if (core && core.exitCode === null) {
     core.kill("SIGTERM");
     await Promise.race([
@@ -260,3 +281,11 @@ try {
   fs.closeSync(log);
   fs.rmSync(runtime, { recursive: true, force: true });
 }
+}
+
+main()
+  .then(result => console.log(JSON.stringify(result, null, 2)))
+  .catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+  });

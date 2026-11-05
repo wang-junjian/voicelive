@@ -3,9 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "./build.sh",
-    "test": "cargo test --workspace"
+    "test": "cargo test --workspace",
+    "test:browser": "node tests/pipeline/browser_acceptance.js"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
   }
 }

@@ -1,4 +1,5 @@
 use crate::error::{CoreError, Result};
+use crate::lifecycle::Lifecycle;
 use crate::output::{OutputRunner, OutputSignal, PlaybackControl};
 use crate::source::RunningSource;
 use crate::source::{SourceEvent, SourceStartOptions, start_source};
@@ -10,9 +11,11 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -85,14 +88,8 @@ impl SessionManager {
     }
 
     pub async fn create(&self, config: PipelineConfig) -> Arc<Session> {
-        // Only one live tap may mute the original audio at a time.
-        for existing in self.list().await {
-            if *existing.state.lock().await == SessionState::Preparing {
-                let _ = existing.stop_model().await;
-            } else {
-                let _ = existing.stop().await;
-            }
-        }
+        // Creating a draft has no side effect on an active meeting. Capture ownership
+        // changes only when prepare/start explicitly moves the resident model.
         let session = Arc::new(Session::new(config, self.options.clone()));
         session.persist().await;
         self.sessions
@@ -106,7 +103,11 @@ impl SessionManager {
         let _gate = self.model_gate.lock().await;
         let session = self.get(id).await?;
         let state = *session.state.lock().await;
-        if matches!(state, SessionState::Ready | SessionState::Preparing) {
+        if state == SessionState::Ready {
+            return Ok(session);
+        }
+        if state == SessionState::Preparing {
+            Self::wait_for_model_ready(&session).await?;
             return Ok(session);
         }
 
@@ -116,7 +117,21 @@ impl SessionManager {
             if existing.id == id {
                 continue;
             }
-            let state = *existing.state.lock().await;
+            let mut state = *existing.state.lock().await;
+            if state == SessionState::Preparing {
+                if let Err(error) = Self::wait_for_model_ready(&existing).await {
+                    let _ = existing.stop_model().await;
+                    return Err(error);
+                }
+                state = SessionState::Ready;
+            }
+            if state == SessionState::Configuring {
+                existing.stop().await?;
+            }
+            if matches!(state, SessionState::Stopping | SessionState::Faulted) {
+                existing.stop_model().await?;
+                continue;
+            }
             if matches!(state, SessionState::Running | SessionState::Paused) {
                 existing.stop().await?;
             }
@@ -127,6 +142,35 @@ impl SessionManager {
         }
         session.prepare().await?;
         Ok(session)
+    }
+
+    async fn wait_for_model_ready(session: &Arc<Session>) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(180), async {
+            loop {
+                match *session.state.lock().await {
+                    SessionState::Ready => return Ok(()),
+                    SessionState::Preparing => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    SessionState::Faulted => {
+                        let message = session
+                            .last_error
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_else(|| "translator failed before ready".into());
+                        return Err(CoreError::Translator(message));
+                    }
+                    state => {
+                        return Err(CoreError::InvalidState(format!(
+                            "translator cannot become ready while {state:?}"
+                        )));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| CoreError::Translator("translator ready timed out".into()))?
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Arc<Session>> {
@@ -159,12 +203,17 @@ impl SessionManager {
 
     pub async fn stop_all(&self) {
         for session in self.list().await {
-            let _ = session.stop_model().await;
+            if let Err(error) = session.stop_model().await {
+                tracing::warn!(session_id = %session.id, "failed to stop session: {error}");
+            }
         }
     }
 }
 
 const SUBTITLE_MEMORY_LIMIT: usize = 512;
+const LIFECYCLE_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const RESOURCE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const PENDING_SPEECH_LIMIT: usize = 32;
 
 struct Runtime {
     translator: Option<Box<dyn RunningTranslator>>,
@@ -175,16 +224,88 @@ struct Runtime {
     source_task: Option<JoinHandle<()>>,
 }
 
+struct PlaybackUpdate {
+    pending: u64,
+    count_event: bool,
+}
+
+#[derive(Default)]
+struct PlaybackLedger {
+    states: HashMap<u64, PlaybackEventType>,
+    terminal_order: VecDeque<u64>,
+    pending: u64,
+}
+
+impl PlaybackLedger {
+    fn apply(&mut self, token: u64, event_type: PlaybackEventType) -> PlaybackUpdate {
+        let previous = self.states.get(&token).copied();
+        let next = if previous.is_some_and(is_terminal_playback) {
+            previous.expect("terminal playback state")
+        } else if previous == Some(PlaybackEventType::Started)
+            && event_type == PlaybackEventType::Queued
+        {
+            PlaybackEventType::Started
+        } else {
+            event_type
+        };
+        let was_pending = previous.is_some_and(is_pending_playback);
+        let is_pending = is_pending_playback(next);
+        if was_pending && !is_pending {
+            self.pending = self.pending.saturating_sub(1);
+        } else if !was_pending && is_pending {
+            self.pending += 1;
+        }
+        let count_event = previous != Some(next) && next == event_type;
+        if count_event && is_terminal_playback(next) {
+            self.terminal_order.push_back(token);
+            while self.terminal_order.len() > 64 {
+                if let Some(expired) = self.terminal_order.pop_front() {
+                    self.states.remove(&expired);
+                }
+            }
+        }
+        self.states.insert(token, next);
+        PlaybackUpdate {
+            pending: self.pending,
+            count_event,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.states.clear();
+        self.terminal_order.clear();
+        self.pending = 0;
+    }
+}
+
+fn is_terminal_playback(event_type: PlaybackEventType) -> bool {
+    matches!(
+        event_type,
+        PlaybackEventType::Finished
+            | PlaybackEventType::Cancelled
+            | PlaybackEventType::Failed
+            | PlaybackEventType::Expired
+    )
+}
+
+fn is_pending_playback(event_type: PlaybackEventType) -> bool {
+    !is_terminal_playback(event_type)
+}
+
 pub struct Session {
     pub id: Uuid,
     config: RwLock<PipelineConfig>,
     metadata: Mutex<SessionMetadata>,
     state: Mutex<SessionState>,
     epoch: AtomicU64,
+    timeline_offset_ns: AtomicU64,
+    timeline_offsets: Mutex<HashMap<(u64, u64), i64>>,
     metrics: Mutex<SessionMetrics>,
+    playback: Mutex<PlaybackLedger>,
+    pending_speech: Mutex<VecDeque<TranslationEvent>>,
     last_error: Mutex<Option<String>>,
     runtime: Mutex<Option<Runtime>>,
-    io_recovery: Mutex<()>,
+    lifecycle: Lifecycle,
     subtitles: Mutex<SubtitleAssembler>,
     history: Mutex<VecDeque<SubtitleCue>>,
     events: broadcast::Sender<SessionEvent>,
@@ -218,13 +339,17 @@ impl Session {
             metadata: Mutex::new(stored.metadata),
             state: Mutex::new(SessionState::Idle),
             epoch: AtomicU64::new(1),
+            timeline_offset_ns: AtomicU64::new(0),
+            timeline_offsets: Mutex::new(HashMap::new()),
             metrics: Mutex::new(SessionMetrics {
                 captured_duration_us: audio_duration_us,
                 ..SessionMetrics::default()
             }),
+            playback: Mutex::new(PlaybackLedger::default()),
+            pending_speech: Mutex::new(VecDeque::new()),
             last_error: Mutex::new(None),
             runtime: Mutex::new(None),
-            io_recovery: Mutex::new(()),
+            lifecycle: Lifecycle::new(),
             subtitles: Mutex::new(SubtitleAssembler::default()),
             history: Mutex::new(VecDeque::new()),
             events,
@@ -279,9 +404,11 @@ impl Session {
         self.emit(SessionEventKind::State { state, message });
     }
 
-    async fn fault(&self, code: &str, message: String, fatal: bool) {
+    async fn fault(self: &Arc<Self>, code: &str, message: String, fatal: bool) {
         *self.last_error.lock().await = Some(message.clone());
+        let previous_state = *self.state.lock().await;
         if fatal {
+            self.lifecycle.cancel_current().await;
             self.set_state(SessionState::Faulted, Some(message.clone()))
                 .await;
         }
@@ -290,9 +417,30 @@ impl Session {
             message,
             fatal,
         });
+        if fatal
+            && !matches!(
+                previous_state,
+                SessionState::Faulted | SessionState::Stopping
+            )
+        {
+            let session = Arc::clone(self);
+            tokio::spawn(async move {
+                let operation = session.lifecycle.begin().await;
+                let _ = session
+                    .stop_model_with_operation(SessionState::Faulted, &operation)
+                    .await;
+            });
+        }
     }
 
     async fn detach_translator(self: &Arc<Self>) -> Result<Option<Box<dyn RunningTranslator>>> {
+        let _operation = self.lifecycle.begin().await;
+        self.detach_translator_locked().await
+    }
+
+    async fn detach_translator_locked(
+        self: &Arc<Self>,
+    ) -> Result<Option<Box<dyn RunningTranslator>>> {
         if *self.state.lock().await != SessionState::Ready {
             return Ok(None);
         }
@@ -319,7 +467,17 @@ impl Session {
 
     async fn adopt_translator(
         self: &Arc<Self>,
+        translator: Box<dyn RunningTranslator>,
+    ) -> Result<()> {
+        let operation = self.lifecycle.begin().await;
+        self.adopt_translator_with_operation(translator, &operation)
+            .await
+    }
+
+    async fn adopt_translator_with_operation(
+        self: &Arc<Self>,
         mut translator: Box<dyn RunningTranslator>,
+        operation: &crate::lifecycle::Operation<'_>,
     ) -> Result<()> {
         let state = *self.state.lock().await;
         if !matches!(state, SessionState::Idle | SessionState::Faulted) {
@@ -328,7 +486,8 @@ impl Session {
             )));
         }
         if self.runtime.lock().await.is_some() {
-            self.stop_model().await?;
+            self.stop_model_with_operation(SessionState::Idle, operation)
+                .await?;
         }
         self.set_state(
             SessionState::Preparing,
@@ -342,14 +501,19 @@ impl Session {
         };
         let epoch = self.epoch.load(Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(256);
-        let attached = async {
-            translator.reattach(self.id, epoch, sender).await?;
-            if let Some(direction) = direction {
-                translator.set_direction(&direction).await?;
-            }
-            Ok::<(), CoreError>(())
-        }
-        .await;
+        let attached = operation
+            .run_with_timeout(
+                LIFECYCLE_IO_TIMEOUT,
+                "attaching the resident translator",
+                async {
+                    translator.reattach(self.id, epoch, sender).await?;
+                    if let Some(direction) = direction {
+                        translator.set_direction(&direction).await?;
+                    }
+                    Ok::<(), CoreError>(())
+                },
+            )
+            .await;
         if let Err(error) = attached {
             let _ = translator.stop().await;
             self.fault("model_not_ready", error.to_string(), true).await;
@@ -364,7 +528,7 @@ impl Session {
             source_task: None,
         });
         let weak = Arc::downgrade(self);
-        let task = tokio::spawn(forward_translator(weak, receiver));
+        let task = tokio::spawn(forward_translator(weak, receiver, operation.token()));
         if let Some(runtime) = self.runtime.lock().await.as_mut() {
             runtime.translator_task = Some(task);
         }
@@ -378,6 +542,14 @@ impl Session {
     }
 
     pub async fn prepare(self: &Arc<Self>) -> Result<()> {
+        let operation = self.lifecycle.begin().await;
+        self.prepare_with_operation(&operation).await
+    }
+
+    async fn prepare_with_operation(
+        self: &Arc<Self>,
+        operation: &crate::lifecycle::Operation<'_>,
+    ) -> Result<()> {
         let state = *self.state.lock().await;
         if state == SessionState::Ready || state == SessionState::Preparing {
             return Ok(());
@@ -388,28 +560,42 @@ impl Session {
             )));
         }
         if self.runtime.lock().await.is_some() {
-            self.stop().await?;
+            self.stop_model_with_operation(SessionState::Idle, operation)
+                .await?;
         }
         self.set_state(SessionState::Preparing, Some("loading translator".into()))
             .await;
         let config = self.config.read().await.clone();
         let epoch = self.epoch.load(Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel(256);
-        let translator = match start_translator(
-            &config.translator,
-            self.id,
-            epoch,
-            sender,
-            &self.options.runtime_dir,
-        )
-        .await
+        let mut translator = match operation
+            .run_with_timeout(
+                LIFECYCLE_IO_TIMEOUT,
+                "starting the translator process",
+                start_translator(
+                    &config.translator,
+                    self.id,
+                    epoch,
+                    sender,
+                    &self.options.runtime_dir,
+                ),
+            )
+            .await
         {
             Ok(translator) => translator,
             Err(error) => {
-                self.fault("model_not_ready", error.to_string(), true).await;
+                if !operation.is_cancelled() {
+                    self.fault("model_not_ready", error.to_string(), true).await;
+                }
                 return Err(error);
             }
         };
+        if operation.is_cancelled() {
+            let _ = translator.stop().await;
+            return Err(CoreError::InvalidState(
+                "translator start was cancelled before commit".into(),
+            ));
+        }
         {
             let mut guard = self.runtime.lock().await;
             *guard = Some(Runtime {
@@ -422,8 +608,9 @@ impl Session {
             });
         }
         let weak = Arc::downgrade(self);
+        let cancellation = operation.token();
         let task = tokio::spawn(async move {
-            forward_translator(weak, receiver).await;
+            forward_translator(weak, receiver, cancellation).await;
         });
         if let Some(runtime) = self.runtime.lock().await.as_mut() {
             runtime.translator_task = Some(task);
@@ -432,74 +619,134 @@ impl Session {
     }
 
     pub async fn start(self: &Arc<Self>) -> Result<()> {
+        let operation = self.lifecycle.begin().await;
+        self.start_with_operation(&operation).await
+    }
+
+    async fn start_with_operation(
+        self: &Arc<Self>,
+        operation: &crate::lifecycle::Operation<'_>,
+    ) -> Result<()> {
         let state = *self.state.lock().await;
-        if state != SessionState::Ready {
+        if !matches!(state, SessionState::Ready | SessionState::Paused) {
             return Err(CoreError::InvalidState(format!(
                 "cannot start while {state:?}; prepare and wait for ready"
             )));
         }
+        self.set_state(
+            SessionState::Configuring,
+            Some("starting a new capture run".into()),
+        )
+        .await;
         let config = self.config.read().await.clone();
-        let epoch = self.epoch.load(Ordering::Relaxed);
+        let timeline_offset_ns = self
+            .metadata
+            .lock()
+            .await
+            .audio_duration_us
+            .saturating_mul(1_000);
+        self.timeline_offset_ns
+            .store(timeline_offset_ns, Ordering::Release);
+        self.timeline_offsets.lock().await.clear();
+        self.pending_speech.lock().await.clear();
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let (translator_sender, translator_receiver) = mpsc::channel(256);
+        let old_translator_task = self
+            .runtime
+            .lock()
+            .await
+            .as_mut()
+            .and_then(|runtime| runtime.translator_task.take());
+        if let Some(task) = old_translator_task {
+            task.abort();
+            let _ = task.await;
+        }
         let (output_sender, output_receiver) = mpsc::channel(256);
         let mut runtime_guard = self.runtime.lock().await;
         let runtime = runtime_guard
             .as_mut()
             .ok_or_else(|| CoreError::InvalidState("runtime missing".into()))?;
-        let output = match OutputRunner::start(
-            &config.output,
-            config.latency_mode,
-            self.id,
-            epoch,
-            output_sender,
-        )
-        .await
+        let reattached = {
+            let translator = runtime
+                .translator
+                .as_mut()
+                .ok_or_else(|| CoreError::InvalidState("translator missing".into()))?;
+            operation
+                .run_with_timeout(
+                    LIFECYCLE_IO_TIMEOUT,
+                    "resetting the translator for a new run",
+                    translator.reattach(self.id, epoch, translator_sender),
+                )
+                .await
+        };
+        if let Err(error) = reattached {
+            drop(runtime_guard);
+            if !operation.is_cancelled() {
+                self.fault("model_reset", error.to_string(), true).await;
+            }
+            return Err(error);
+        }
+        let output = match operation
+            .run_with_timeout(
+                LIFECYCLE_IO_TIMEOUT,
+                "starting the output process",
+                OutputRunner::start(
+                    &config.output,
+                    config.latency_mode,
+                    self.id,
+                    epoch,
+                    output_sender,
+                ),
+            )
+            .await
         {
             Ok(output) => output,
             Err(error) => {
                 drop(runtime_guard);
-                self.fault("output_unavailable", error.to_string(), true)
-                    .await;
+                if !operation.is_cancelled() {
+                    self.fault("output_unavailable", error.to_string(), true)
+                        .await;
+                }
                 return Err(error);
             }
         };
         let playback_pid = output.playback_pid();
         runtime.output = Some(output);
         let (source_sender, source_receiver) = mpsc::channel(config.queue.max_frames.max(2));
-        let source = match start_source(
-            &config.source,
-            &SourceStartOptions {
-                audio_host: self.options.audio_host.clone(),
-                playback_pid,
-            },
-            self.id,
-            epoch,
-            source_sender,
-        )
-        .await
+        let source = match operation
+            .run_with_timeout(
+                LIFECYCLE_IO_TIMEOUT,
+                "starting the audio source",
+                start_source(
+                    &config.source,
+                    &SourceStartOptions {
+                        audio_host: self.options.audio_host.clone(),
+                        playback_pid,
+                    },
+                    self.id,
+                    epoch,
+                    source_sender,
+                ),
+            )
+            .await
         {
             Ok(source) => source,
             Err(error) => {
                 if let Some(output) = runtime.output.as_mut() {
-                    let _ = output.stop().await;
+                    let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
                 }
                 runtime.output = None;
                 drop(runtime_guard);
-                self.fault("source_unavailable", error.to_string(), true)
-                    .await;
+                if !operation.is_cancelled() {
+                    self.fault("source_unavailable", error.to_string(), true)
+                        .await;
+                }
                 return Err(error);
             }
         };
         runtime.source = Some(source);
         drop(runtime_guard);
 
-        let weak = Arc::downgrade(self);
-        let output_task = tokio::spawn(forward_output(weak, output_receiver));
-        let weak = Arc::downgrade(self);
-        let source_task = tokio::spawn(forward_source(weak, source_receiver, config.queue));
-        if let Some(runtime) = self.runtime.lock().await.as_mut() {
-            runtime.output_task = Some(output_task);
-            runtime.source_task = Some(source_task);
-        }
         {
             let mut metadata = self.metadata.lock().await;
             if metadata.started_at_ms.is_none() {
@@ -507,56 +754,91 @@ impl Session {
             }
             metadata.ended_at_ms = None;
         }
+        self.playback.lock().await.clear();
+        {
+            let mut metrics = self.metrics.lock().await;
+            metrics.playback_pending = 0;
+            metrics.tts_queue_depth = 0;
+            metrics.sent_duration_us = 0;
+            metrics.completed_duration_us = 0;
+            metrics.model_backlog_us = 0;
+        }
         self.persist().await;
+        if operation.is_cancelled() {
+            return Err(CoreError::InvalidState(
+                "capture start was cancelled before commit".into(),
+            ));
+        }
         self.set_state(SessionState::Running, Some("capturing".into()))
             .await;
+        let translator_task = tokio::spawn(forward_translator(
+            Arc::downgrade(self),
+            translator_receiver,
+            operation.token(),
+        ));
+        let output_task = tokio::spawn(forward_output(
+            Arc::downgrade(self),
+            output_receiver,
+            operation.token(),
+        ));
+        let source_task = tokio::spawn(forward_source(
+            Arc::downgrade(self),
+            source_receiver,
+            config.queue,
+            operation.token(),
+        ));
+        if let Some(runtime) = self.runtime.lock().await.as_mut() {
+            runtime.translator_task = Some(translator_task);
+            runtime.output_task = Some(output_task);
+            runtime.source_task = Some(source_task);
+        }
         Ok(())
     }
 
-    pub async fn pause(&self) -> Result<()> {
+    pub async fn pause(self: &Arc<Self>) -> Result<()> {
         if *self.state.lock().await != SessionState::Running {
             return Err(CoreError::InvalidState(
                 "only a running session can pause".into(),
             ));
         }
-        self.set_state(
-            SessionState::Paused,
-            Some("live input is discarded while paused".into()),
-        )
-        .await;
-        let mut runtime = self.runtime.lock().await;
-        if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
-            output.pause().await?;
-        }
-        Ok(())
-    }
-
-    pub async fn resume(&self) -> Result<()> {
-        if *self.state.lock().await != SessionState::Paused {
+        self.lifecycle.cancel_current().await;
+        let operation = self.lifecycle.begin().await;
+        if *self.state.lock().await != SessionState::Running {
             return Err(CoreError::InvalidState(
-                "only a paused session can resume".into(),
+                "session stopped before pause acquired the lifecycle gate".into(),
             ));
         }
-        let mut runtime = self.runtime.lock().await;
-        if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
-            output.resume().await?;
-        }
-        drop(runtime);
-        self.set_state(
-            SessionState::Running,
-            Some("capturing from the live edge".into()),
-        )
-        .await;
-        Ok(())
+        self.stop_capture_with_operation(Some(SessionState::Paused), &operation)
+            .await
+    }
+
+    pub async fn resume(self: &Arc<Self>) -> Result<()> {
+        self.start().await
     }
 
     /// Stops capture and playback while keeping the expensive model process warm.
-    pub async fn stop(&self) -> Result<()> {
+    pub async fn stop(self: &Arc<Self>) -> Result<()> {
+        self.lifecycle.cancel_current().await;
+        let operation = self.lifecycle.begin().await;
+        if *self.state.lock().await == SessionState::Preparing {
+            return self
+                .stop_model_with_operation(SessionState::Idle, &operation)
+                .await;
+        }
+        self.stop_capture_with_operation(None, &operation).await
+    }
+
+    async fn stop_capture_with_operation(
+        self: &Arc<Self>,
+        requested_state: Option<SessionState>,
+        operation: &crate::lifecycle::Operation<'_>,
+    ) -> Result<()> {
         let state = *self.state.lock().await;
-        if state == SessionState::Idle || state == SessionState::Stopping {
+        if matches!(state, SessionState::Idle | SessionState::Stopping) {
             return Ok(());
         }
         self.set_state(SessionState::Stopping, None).await;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         let (mut source, mut output, source_task, output_task, has_translator) = {
             let mut guard = self.runtime.lock().await;
             let has_translator = guard
@@ -574,51 +856,91 @@ impl Session {
                 (None, None, None, None, has_translator)
             }
         };
-        if let Some(task) = source_task {
+        for task in [source_task, output_task].into_iter().flatten() {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = output_task {
-            task.abort();
-            let _ = task.await;
-        }
+        let mut cleanup_error = None;
         if let Some(source) = source.as_mut() {
-            source.stop().await?;
+            match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => cleanup_error = Some(error.to_string()),
+                Err(_) => cleanup_error = Some("audio source stop timed out".into()),
+            }
         }
         if let Some(output) = output.as_mut() {
-            output.stop().await?;
+            match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => cleanup_error = Some(error.to_string()),
+                Err(_) => cleanup_error = Some("output stop timed out".into()),
+            }
+        }
+        self.playback.lock().await.clear();
+        self.pending_speech.lock().await.clear();
+        {
+            let mut metrics = self.metrics.lock().await;
+            metrics.playback_pending = 0;
+            metrics.tts_queue_depth = 0;
         }
         self.flush_subtitle().await;
-        if matches!(state, SessionState::Running | SessionState::Paused) {
-            self.metadata.lock().await.ended_at_ms = Some(now_ms());
-            self.persist().await;
+        let captured_duration_us = self.metrics.lock().await.captured_duration_us;
+        {
+            let mut metadata = self.metadata.lock().await;
+            metadata.audio_duration_us = captured_duration_us;
+            if requested_state.is_none()
+                && matches!(state, SessionState::Running | SessionState::Paused)
+            {
+                metadata.ended_at_ms = Some(now_ms());
+            }
         }
-        let next_state = if has_translator {
+        self.persist().await;
+        if let Some(message) = cleanup_error {
+            self.fault("resource_stop", message.clone(), true).await;
+            return Err(CoreError::Output(message));
+        }
+        let next_state = requested_state.unwrap_or(if has_translator {
             SessionState::Ready
         } else {
             SessionState::Idle
-        };
+        });
         self.set_state(
             next_state,
             Some("capture stopped; original audio restored; model kept warm".into()),
         )
         .await;
+        let _ = operation;
         Ok(())
     }
 
     /// Stops the complete pipeline and unloads the model.
-    pub async fn stop_model(&self) -> Result<()> {
+    pub async fn stop_model(self: &Arc<Self>) -> Result<()> {
+        self.lifecycle.cancel_current().await;
+        let operation = self.lifecycle.begin().await;
+        self.stop_model_with_operation(SessionState::Idle, &operation)
+            .await
+    }
+
+    async fn stop_model_with_operation(
+        self: &Arc<Self>,
+        next_state: SessionState,
+        operation: &crate::lifecycle::Operation<'_>,
+    ) -> Result<()> {
         let state = *self.state.lock().await;
-        if state == SessionState::Stopping {
-            return Ok(());
+        let captured_duration_us = self.metrics.lock().await.captured_duration_us;
+        {
+            let mut metadata = self.metadata.lock().await;
+            metadata.audio_duration_us = captured_duration_us;
+            if matches!(state, SessionState::Running | SessionState::Paused) {
+                metadata.ended_at_ms = Some(now_ms());
+            }
         }
         if matches!(state, SessionState::Running | SessionState::Paused) {
-            self.metadata.lock().await.ended_at_ms = Some(now_ms());
             self.persist().await;
         }
         self.set_state(SessionState::Stopping, None).await;
-        self.epoch.fetch_add(1, Ordering::Relaxed);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         let runtime = self.runtime.lock().await.take();
+        let mut cleanup_error = None;
         if let Some(mut runtime) = runtime {
             for task in [
                 runtime.source_task.take(),
@@ -632,21 +954,56 @@ impl Session {
                 let _ = task.await;
             }
             if let Some(source) = runtime.source.as_mut() {
-                let _ = source.stop().await;
+                match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => cleanup_error = Some(error.to_string()),
+                    Err(_) => cleanup_error = Some("audio source stop timed out".into()),
+                }
             }
             if let Some(output) = runtime.output.as_mut() {
-                let _ = output.stop().await;
+                match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => cleanup_error = Some(error.to_string()),
+                    Err(_) => cleanup_error = Some("output stop timed out".into()),
+                }
             }
             if let Some(translator) = runtime.translator.as_mut() {
-                let _ = translator.stop().await;
+                match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, translator.stop()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => cleanup_error = Some(error.to_string()),
+                    Err(_) => cleanup_error = Some("translator stop timed out".into()),
+                }
             }
         }
+        self.playback.lock().await.clear();
+        self.pending_speech.lock().await.clear();
+        {
+            let mut metrics = self.metrics.lock().await;
+            metrics.playback_pending = 0;
+            metrics.tts_queue_depth = 0;
+        }
         self.flush_subtitle().await;
-        self.set_state(
-            SessionState::Idle,
-            Some("model stopped; original audio restored".into()),
-        )
-        .await;
+        if let Some(message) = cleanup_error {
+            *self.last_error.lock().await = Some(message.clone());
+            self.emit(SessionEventKind::Error {
+                code: "resource_stop".into(),
+                message: message.clone(),
+                fatal: true,
+            });
+            self.set_state(
+                SessionState::Faulted,
+                Some("resource cleanup failed".into()),
+            )
+            .await;
+            return Err(CoreError::Output(message));
+        } else {
+            self.set_state(
+                next_state,
+                Some("model stopped; original audio restored".into()),
+            )
+            .await;
+        }
+        let _ = operation;
         Ok(())
     }
 
@@ -655,6 +1012,7 @@ impl Session {
         source: SourceConfig,
         mute_original: bool,
     ) -> Result<()> {
+        let operation = self.lifecycle.begin().await;
         let state = *self.state.lock().await;
         if !matches!(
             state,
@@ -670,90 +1028,97 @@ impl Session {
             config.mute_original = mute_original;
         }
         self.persist().await;
-        if !matches!(state, SessionState::Running | SessionState::Paused) {
+        if state != SessionState::Running {
             return Ok(());
         }
 
-        let (mut old_source, old_task, playback_pid, queue) = {
-            let mut guard = self.runtime.lock().await;
-            let runtime = guard
-                .as_mut()
-                .ok_or_else(|| CoreError::InvalidState("runtime missing".into()))?;
-            (
-                runtime.source.take(),
-                runtime.source_task.take(),
-                runtime
-                    .output
-                    .as_ref()
-                    .and_then(|output| output.playback_pid()),
-                self.config.read().await.queue.clone(),
-            )
-        };
-        if let Some(task) = old_task {
-            task.abort();
-            let _ = task.await;
-        }
-        if let Some(source) = old_source.as_mut() {
-            source.stop().await?;
-        }
-        self.flush_subtitle().await;
-        {
-            let mut guard = self.runtime.lock().await;
-            if let Some(runtime) = guard.as_mut() {
-                if let Some(translator) = runtime.translator.as_mut() {
-                    translator.reset_source().await?;
-                }
-                if let Some(output) = runtime.output.as_mut() {
-                    output.flush().await?;
-                }
-            }
-        }
-
-        let epoch = self.epoch.load(Ordering::Relaxed);
-        let (sender, receiver) = mpsc::channel(queue.max_frames.max(2));
-        let new_source = match start_source(
-            &source,
-            &SourceStartOptions {
-                audio_host: self.options.audio_host.clone(),
-                playback_pid,
-            },
-            self.id,
-            epoch,
-            sender,
-        )
-        .await
-        {
-            Ok(source) => source,
-            Err(error) => {
-                self.fault("source_unavailable", error.to_string(), true)
-                    .await;
-                return Err(error);
-            }
-        };
-        let weak = Arc::downgrade(self);
-        let task = tokio::spawn(forward_source(weak, receiver, queue));
-        let mut guard = self.runtime.lock().await;
-        if let Some(runtime) = guard.as_mut() {
-            runtime.source = Some(new_source);
-            runtime.source_task = Some(task);
-        }
+        self.stop_capture_with_operation(None, &operation).await?;
+        self.start_with_operation(&operation).await?;
         self.emit(SessionEventKind::State {
-            state,
-            message: Some("audio source switched".into()),
+            state: SessionState::Running,
+            message: Some("audio source switched in a new capture run".into()),
         });
         Ok(())
+    }
+
+    async fn recover_translator(self: &Arc<Self>, message: String) {
+        let operation = self.lifecycle.begin().await;
+        let state = *self.state.lock().await;
+        if matches!(state, SessionState::Preparing | SessionState::Ready) {
+            self.fault("model_stream_ended", message, true).await;
+            return;
+        }
+        if state != SessionState::Running {
+            return;
+        }
+        let mut runtime = self.runtime.lock().await;
+        let result = operation
+            .run_with_timeout(LIFECYCLE_IO_TIMEOUT, "recovering the model stream", async {
+                let translator = runtime
+                    .as_mut()
+                    .and_then(|runtime| runtime.translator.as_mut())
+                    .ok_or_else(|| CoreError::InvalidState("translator missing".into()))?;
+                translator.recover().await
+            })
+            .await;
+        drop(runtime);
+        if let Err(error) = result
+            && !operation.is_cancelled()
+        {
+            self.fault("model_recovery", error.to_string(), true).await;
+        }
+    }
+
+    async fn flush_pending_speech(
+        self: &Arc<Self>,
+        operation: &crate::lifecycle::Operation<'_>,
+    ) -> Result<()> {
+        loop {
+            let Some(event) = self.pending_speech.lock().await.pop_front() else {
+                return Ok(());
+            };
+            let cancellation = operation.token();
+            let mut runtime = self.runtime.lock().await;
+            let result = if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        Err(CoreError::InvalidState("speech recovery was cancelled".into()))
+                    }
+                    result = output.submit(event.clone()) => result,
+                }
+            } else {
+                Err(CoreError::InvalidState(
+                    "recovered output is unavailable".into(),
+                ))
+            };
+            drop(runtime);
+            if let Err(error) = result {
+                self.pending_speech.lock().await.push_front(event);
+                if !operation.is_cancelled() {
+                    self.fault("tts_recovery", error.to_string(), true).await;
+                }
+                return Err(error);
+            }
+        }
     }
 
     fn recover_output(
         self: Arc<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
         Box::pin(async move {
-            let _recovery = self.io_recovery.lock().await;
+            let operation = self.lifecycle.begin().await;
             let state = *self.state.lock().await;
-            if !matches!(state, SessionState::Running | SessionState::Paused) {
+            if state != SessionState::Running {
                 return Ok(());
             }
             let config = self.config.read().await.clone();
+            if matches!(&config.source, SourceConfig::File { .. }) {
+                let error = CoreError::Output(
+                    "file input cannot safely resume after an output restart; start a new run explicitly".into(),
+                );
+                self.fault("output_recovery", error.to_string(), true).await;
+                return Err(error);
+            }
             let epoch = self.epoch.load(Ordering::Relaxed);
             let (mut old_source, mut old_output, source_task, output_task) = {
                 let mut guard = self.runtime.lock().await;
@@ -772,61 +1137,110 @@ impl Session {
                 let _ = task.await;
             }
             if let Some(source) = old_source.as_mut() {
-                let _ = source.stop().await;
+                let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await;
             }
             if let Some(output) = old_output.as_mut() {
-                let _ = output.stop().await;
+                let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
+            }
+
+            self.playback.lock().await.clear();
+            {
+                let mut metrics = self.metrics.lock().await;
+                metrics.playback_pending = 0;
+                metrics.tts_queue_depth = 0;
             }
 
             let (output_sender, output_receiver) = mpsc::channel(256);
-            let mut output = match OutputRunner::start(
-                &config.output,
-                config.latency_mode,
-                self.id,
-                epoch,
-                output_sender,
-            )
-            .await
+            let mut output = match operation
+                .run_with_timeout(
+                    LIFECYCLE_IO_TIMEOUT,
+                    "restarting the output process",
+                    OutputRunner::start(
+                        &config.output,
+                        config.latency_mode,
+                        self.id,
+                        epoch,
+                        output_sender,
+                    ),
+                )
+                .await
             {
                 Ok(output) => output,
                 Err(error) => {
-                    self.fault("output_recovery", error.to_string(), true).await;
+                    if !operation.is_cancelled() {
+                        self.fault("output_recovery", error.to_string(), true).await;
+                    }
                     return Err(error);
                 }
             };
             let playback_pid = output.playback_pid();
             let (source_sender, source_receiver) = mpsc::channel(config.queue.max_frames.max(2));
-            let source = match start_source(
-                &config.source,
-                &SourceStartOptions {
-                    audio_host: self.options.audio_host.clone(),
-                    playback_pid,
-                },
-                self.id,
-                epoch,
-                source_sender,
-            )
-            .await
+            let mut source = match operation
+                .run_with_timeout(
+                    LIFECYCLE_IO_TIMEOUT,
+                    "restarting the audio source",
+                    start_source(
+                        &config.source,
+                        &SourceStartOptions {
+                            audio_host: self.options.audio_host.clone(),
+                            playback_pid,
+                        },
+                        self.id,
+                        epoch,
+                        source_sender,
+                    ),
+                )
+                .await
             {
                 Ok(source) => source,
                 Err(error) => {
-                    let _ = output.stop().await;
-                    self.fault("source_recovery", error.to_string(), true).await;
+                    let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
+                    if !operation.is_cancelled() {
+                        self.fault("source_recovery", error.to_string(), true).await;
+                    }
                     return Err(error);
                 }
             };
-            let output_task = tokio::spawn(forward_output(Arc::downgrade(&self), output_receiver));
+            let current_state = *self.state.lock().await;
+            if operation.is_cancelled()
+                || self.epoch.load(Ordering::Acquire) != epoch
+                || current_state != SessionState::Running
+            {
+                let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await;
+                let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
+                return Err(CoreError::InvalidState(
+                    "output recovery was cancelled before commit".into(),
+                ));
+            }
+            let output_task = tokio::spawn(forward_output(
+                Arc::downgrade(&self),
+                output_receiver,
+                operation.token(),
+            ));
             let source_task = tokio::spawn(forward_source(
                 Arc::downgrade(&self),
                 source_receiver,
                 config.queue,
+                operation.token(),
             ));
-            if let Some(runtime) = self.runtime.lock().await.as_mut() {
+            let mut guard = self.runtime.lock().await;
+            if let Some(runtime) = guard.as_mut() {
                 runtime.output = Some(output);
                 runtime.source = Some(source);
                 runtime.output_task = Some(output_task);
                 runtime.source_task = Some(source_task);
+            } else {
+                output_task.abort();
+                source_task.abort();
+                drop(guard);
+                let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await;
+                let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
+                return Err(CoreError::InvalidState(
+                    "output recovery found no active runtime".into(),
+                ));
             }
+            drop(guard);
+            self.flush_pending_speech(&operation).await?;
             self.emit(SessionEventKind::Warning {
                 code: "output_recovered".into(),
                 message: "audio input and output recovered; translator kept warm".into(),
@@ -916,10 +1330,10 @@ impl Session {
     }
 
     pub async fn history(&self) -> Vec<SubtitleCue> {
-        if let Ok(contents) = tokio::fs::read_to_string(self.history_path()).await {
-            if let Some(history) = fold_subtitle_history(&contents) {
-                return history;
-            }
+        if let Ok(contents) = tokio::fs::read_to_string(self.history_path()).await
+            && let Some(history) = fold_subtitle_history(&contents)
+        {
+            return history;
         }
         self.history.lock().await.iter().cloned().collect()
     }
@@ -927,13 +1341,13 @@ impl Session {
     pub async fn clear_history(&self) {
         self.history.lock().await.clear();
         *self.subtitles.lock().await = SubtitleAssembler::default();
-        if let Err(error) = tokio::fs::remove_file(self.history_path()).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                self.emit(SessionEventKind::Warning {
-                    code: "subtitle_storage".into(),
-                    message: format!("failed to remove subtitle history: {error}"),
-                });
-            }
+        if let Err(error) = tokio::fs::remove_file(self.history_path()).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            self.emit(SessionEventKind::Warning {
+                code: "subtitle_storage".into(),
+                message: format!("failed to remove subtitle history: {error}"),
+            });
         }
         self.emit(SessionEventKind::HistoryCleared);
     }
@@ -984,6 +1398,7 @@ impl Session {
     }
 
     pub async fn set_direction(&self, direction: String) -> Result<()> {
+        let operation = self.lifecycle.begin().await;
         let state = *self.state.lock().await;
         if matches!(state, SessionState::Stopping | SessionState::Preparing) {
             return Err(CoreError::InvalidState(format!(
@@ -1015,17 +1430,25 @@ impl Session {
                 OutputConfig::Mock => {}
             }
         }
-        let mut runtime = self.runtime.lock().await;
-        if let Some(runtime) = runtime.as_mut() {
-            if let Some(output) = runtime.output.as_mut() {
-                output.flush().await?;
-                output.set_voice(voice.to_string()).await?;
-            }
-            if let Some(translator) = runtime.translator.as_mut() {
-                translator.set_direction(&direction).await?;
-            }
-        }
-        drop(runtime);
+        operation
+            .run_with_timeout(
+                LIFECYCLE_IO_TIMEOUT,
+                "changing translation direction",
+                async {
+                    let mut runtime = self.runtime.lock().await;
+                    if let Some(runtime) = runtime.as_mut() {
+                        if let Some(output) = runtime.output.as_mut() {
+                            output.flush().await?;
+                            output.set_voice(voice.to_string()).await?;
+                        }
+                        if let Some(translator) = runtime.translator.as_mut() {
+                            translator.set_direction(&direction).await?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await?;
         self.persist().await;
         self.emit(SessionEventKind::State {
             state,
@@ -1035,6 +1458,7 @@ impl Session {
     }
 
     pub async fn set_latency_mode(&self, mode: LatencyMode) -> Result<()> {
+        let operation = self.lifecycle.begin().await;
         let state = *self.state.lock().await;
         if matches!(state, SessionState::Stopping | SessionState::Preparing) {
             return Err(CoreError::InvalidState(format!(
@@ -1042,11 +1466,15 @@ impl Session {
             )));
         }
         self.config.write().await.latency_mode = mode;
-        let mut runtime = self.runtime.lock().await;
-        if let Some(output) = runtime.as_mut().and_then(|runtime| runtime.output.as_mut()) {
-            output.set_latency_mode(mode).await?;
-        }
-        drop(runtime);
+        operation
+            .run_with_timeout(LIFECYCLE_IO_TIMEOUT, "changing voice policy", async {
+                let mut runtime = self.runtime.lock().await;
+                if let Some(output) = runtime.as_mut().and_then(|runtime| runtime.output.as_mut()) {
+                    output.set_latency_mode(mode).await?;
+                }
+                Ok(())
+            })
+            .await?;
         self.persist().await;
         self.emit(SessionEventKind::State {
             state,
@@ -1056,6 +1484,7 @@ impl Session {
     }
 
     pub async fn reconfigure(self: &Arc<Self>, config: PipelineConfig) -> Result<()> {
+        let operation = self.lifecycle.begin().await;
         let state = *self.state.lock().await;
         if state != SessionState::Idle && state != SessionState::Faulted {
             return Err(CoreError::InvalidState(
@@ -1063,7 +1492,8 @@ impl Session {
             ));
         }
         if state == SessionState::Faulted {
-            self.stop_model().await?;
+            self.stop_model_with_operation(SessionState::Idle, &operation)
+                .await?;
         }
         *self.config.write().await = config;
         *self.metrics.lock().await = SessionMetrics::default();
@@ -1102,8 +1532,14 @@ fn fold_subtitle_history(contents: &str) -> Option<Vec<SubtitleCue>> {
 async fn forward_translator(
     weak: std::sync::Weak<Session>,
     mut receiver: mpsc::Receiver<TranslatorSignal>,
+    cancellation: CancellationToken,
 ) {
-    while let Some(signal) = receiver.recv().await {
+    loop {
+        let signal = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            signal = receiver.recv() => signal,
+        };
+        let Some(signal) = signal else { break };
         let Some(session) = weak.upgrade() else { break };
         match signal {
             TranslatorSignal::Ready => {
@@ -1113,7 +1549,7 @@ async fn forward_translator(
                         .await;
                 }
             }
-            TranslatorSignal::Translation(event) => {
+            TranslatorSignal::Translation(mut event) => {
                 if event.epoch != session.epoch.load(Ordering::Relaxed) {
                     continue;
                 }
@@ -1123,6 +1559,23 @@ async fn forward_translator(
                     // not mutate a closed timeline or leak into the next capture run.
                     continue;
                 }
+                event.segment_id = format!(
+                    "run-{}-source-{}-{}",
+                    event.epoch, event.source_generation, event.segment_id
+                );
+                let timeline_offset_ns = session
+                    .timeline_offsets
+                    .lock()
+                    .await
+                    .get(&(event.epoch, event.source_generation))
+                    .copied()
+                    .unwrap_or(0);
+                event.source_start_ns = event
+                    .source_start_ns
+                    .map(|timestamp| timestamp.saturating_add(timeline_offset_ns));
+                event.source_end_ns = event
+                    .source_end_ns
+                    .map(|timestamp| timestamp.saturating_add(timeline_offset_ns));
                 session.metrics.lock().await.translations += 1;
                 session.emit(SessionEventKind::Translation(event.clone()));
                 let cue = session.subtitles.lock().await.push(&event);
@@ -1130,11 +1583,27 @@ async fn forward_translator(
                 if event.speakable {
                     let mut runtime = session.runtime.lock().await;
                     if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
-                        if let Err(error) = output.submit(event).await {
+                        let submitted = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            result = output.submit(event) => result,
+                        };
+                        if let Err(error) = submitted {
                             session.emit(SessionEventKind::Warning {
                                 code: "tts_queue".into(),
                                 message: error.to_string(),
                             });
+                        }
+                    } else {
+                        drop(runtime);
+                        let mut pending = session.pending_speech.lock().await;
+                        if pending.len() >= PENDING_SPEECH_LIMIT {
+                            session.emit(SessionEventKind::Warning {
+                                code: "tts_recovery_queue".into(),
+                                message: "dropped new speech because the recovery queue is full"
+                                    .into(),
+                            });
+                        } else {
+                            pending.push_back(event);
                         }
                     }
                 }
@@ -1169,13 +1638,27 @@ async fn forward_translator(
                 };
                 session.emit(SessionEventKind::Metrics(snapshot));
             }
-            TranslatorSignal::SourceReset => {
+            TranslatorSignal::SourceReset {
+                epoch,
+                source_generation,
+            } => {
+                let offset = session
+                    .timeline_offset_ns
+                    .load(Ordering::Acquire)
+                    .min(i64::MAX as u64) as i64;
+                let mut offsets = session.timeline_offsets.lock().await;
+                offsets.clear();
+                offsets.insert((epoch, source_generation), offset);
+                drop(offsets);
                 let snapshot = {
                     let mut metrics = session.metrics.lock().await;
                     metrics.source_resets += 1;
                     metrics.clone()
                 };
                 session.emit(SessionEventKind::Metrics(snapshot));
+            }
+            TranslatorSignal::StreamEnded(message) => {
+                session.recover_translator(message).await;
             }
             TranslatorSignal::Warning(message) => {
                 session.emit(SessionEventKind::Warning {
@@ -1190,31 +1673,52 @@ async fn forward_translator(
 async fn forward_output(
     weak: std::sync::Weak<Session>,
     mut receiver: mpsc::Receiver<OutputSignal>,
+    cancellation: CancellationToken,
 ) {
-    while let Some(signal) = receiver.recv().await {
+    loop {
+        let signal = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            signal = receiver.recv() => signal,
+        };
+        let Some(signal) = signal else { break };
         let Some(session) = weak.upgrade() else { break };
         match signal {
             OutputSignal::Playback(event) => {
                 if event.token != 0 {
                     let snapshot = {
+                        let update = session
+                            .playback
+                            .lock()
+                            .await
+                            .apply(event.token, event.event_type);
                         let mut metrics = session.metrics.lock().await;
-                        match event.event_type {
-                            PlaybackEventType::Started => {
-                                metrics.playback_started += 1;
-                                metrics.output_latency_us = event.queue_duration_us;
-                                metrics.max_output_latency_us =
-                                    metrics.max_output_latency_us.max(event.queue_duration_us);
-                                if let Some(source_end_ns) = event.source_end_ns {
-                                    let source_end_us = source_end_ns.max(0) as u64 / 1_000;
-                                    metrics.playback_lag_us =
-                                        metrics.captured_duration_us.saturating_sub(source_end_us);
-                                    metrics.max_playback_lag_us =
-                                        metrics.max_playback_lag_us.max(metrics.playback_lag_us);
+                        metrics.playback_pending = update.pending;
+                        if update.count_event {
+                            match event.event_type {
+                                PlaybackEventType::Queued => {}
+                                PlaybackEventType::Started => {
+                                    metrics.playback_started += 1;
+                                    metrics.output_latency_us = event.queue_duration_us;
+                                    metrics.max_output_latency_us =
+                                        metrics.max_output_latency_us.max(event.queue_duration_us);
+                                    if let Some(source_end_ns) = event.source_end_ns {
+                                        let source_end_us = source_end_ns.max(0) as u64 / 1_000;
+                                        metrics.playback_lag_us = metrics
+                                            .captured_duration_us
+                                            .saturating_sub(source_end_us);
+                                        metrics.max_playback_lag_us = metrics
+                                            .max_playback_lag_us
+                                            .max(metrics.playback_lag_us);
+                                    }
                                 }
+                                PlaybackEventType::Finished => {
+                                    metrics.playback_finished += 1;
+                                }
+                                PlaybackEventType::Cancelled => {
+                                    metrics.playback_cancelled += 1;
+                                }
+                                PlaybackEventType::Failed | PlaybackEventType::Expired => {}
                             }
-                            PlaybackEventType::Finished => metrics.playback_finished += 1,
-                            PlaybackEventType::Cancelled => metrics.playback_cancelled += 1,
-                            _ => {}
                         }
                         metrics.clone()
                     };
@@ -1242,6 +1746,9 @@ async fn forward_output(
                     message,
                 });
             }
+            OutputSignal::DrainBarrier(ack) => {
+                let _ = ack.send(());
+            }
             OutputSignal::Exited => {
                 tokio::spawn(async move {
                     let _ = session.recover_output().await;
@@ -1256,9 +1763,17 @@ async fn forward_source(
     weak: std::sync::Weak<Session>,
     mut receiver: mpsc::Receiver<SourceEvent>,
     queue_policy: QueuePolicy,
+    cancellation: CancellationToken,
 ) {
     let mut chunker = AudioChunker::default();
-    while let Some(source_event) = receiver.recv().await {
+    loop {
+        let source_event = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            event = receiver.recv() => event,
+        };
+        let Some(source_event) = source_event else {
+            break;
+        };
         let Some(session) = weak.upgrade() else { break };
         match source_event {
             SourceEvent::Frame(frame) => {
@@ -1286,67 +1801,102 @@ async fn forward_source(
                     }
                 };
                 for block in blocks {
-                    let backlog = {
-                        let metrics = session.metrics.lock().await;
-                        metrics
-                            .sent_duration_us
-                            .saturating_sub(metrics.completed_duration_us)
-                    };
-                    if backlog > queue_policy.max_model_backlog_us as u64 {
-                        let mut metrics = session.metrics.lock().await;
-                        metrics.dropped_frames += 1;
-                        metrics.dropped_duration_us += block.duration_us as u64;
-                        session.emit(SessionEventKind::Warning {
-                            code: "backlog_overflow".into(),
-                            message: format!("dropped one audio block at {backlog} us backlog"),
-                        });
-                        continue;
-                    }
-                    let mut runtime = session.runtime.lock().await;
-                    let result = match runtime.as_mut().and_then(|r| r.translator.as_mut()) {
-                        Some(translator) => translator.push_audio(block.clone()).await,
-                        None => Err(CoreError::InvalidState("translator unavailable".into())),
-                    };
-                    drop(runtime);
-                    match result {
-                        Ok(()) => {
-                            let mut metrics = session.metrics.lock().await;
-                            metrics.sent_frames += 1;
-                            metrics.sent_duration_us += block.duration_us as u64;
-                            metrics.model_backlog_us = metrics
-                                .sent_duration_us
-                                .saturating_sub(metrics.completed_duration_us);
+                    if let Err(error) =
+                        forward_model_block(&session, block, &queue_policy, &cancellation).await
+                    {
+                        if cancellation.is_cancelled() {
+                            return;
                         }
-                        Err(error) => {
-                            session
-                                .fault("translator_write", error.to_string(), true)
-                                .await;
-                            break;
-                        }
+                        session
+                            .fault("translator_write", error.to_string(), true)
+                            .await;
+                        break;
                     }
                 }
             }
-            SourceEvent::Dropped { duration_us } => {
+            SourceEvent::Dropped {
+                duration_us,
+                frames,
+            } => {
                 let mut metrics = session.metrics.lock().await;
-                metrics.dropped_frames += 1;
+                metrics.dropped_frames += frames as u64;
                 metrics.dropped_duration_us += duration_us as u64;
             }
             SourceEvent::Ended => {
-                let mut runtime = session.runtime.lock().await;
-                if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
-                    if let Err(error) = output.finish().await {
-                        session.emit(SessionEventKind::Warning {
-                            code: "tts_finish".into(),
-                            message: error.to_string(),
-                        });
-                    }
-                }
-                drop(runtime);
                 session.emit(SessionEventKind::Warning {
                     code: "source_ended".into(),
-                    message: "audio source ended; stop the session to release remaining resources"
-                        .into(),
+                    message: "audio source ended; draining translation and playback".into(),
                 });
+                if let Some(block) = chunker.finish()
+                    && let Err(error) =
+                        forward_model_block(&session, block, &queue_policy, &cancellation).await
+                {
+                    if !cancellation.is_cancelled() {
+                        session
+                            .fault("translator_write", error.to_string(), true)
+                            .await;
+                    }
+                    break;
+                }
+                let drain_epoch = session.epoch.load(Ordering::Acquire);
+                let session = Arc::clone(&session);
+                tokio::spawn(async move {
+                    let operation = session.lifecycle.begin().await;
+                    let cancellation = operation.token();
+                    if operation.is_cancelled()
+                        || session.epoch.load(Ordering::Acquire) != drain_epoch
+                    {
+                        return;
+                    }
+                    if let Err(error) = wait_for_model_drain(&session, &cancellation).await {
+                        if !cancellation.is_cancelled()
+                            && session.epoch.load(Ordering::Acquire) == drain_epoch
+                        {
+                            session.fault("model_drain", error.to_string(), true).await;
+                        }
+                        return;
+                    }
+                    if cancellation.is_cancelled()
+                        || session.epoch.load(Ordering::Acquire) != drain_epoch
+                    {
+                        return;
+                    }
+                    session.flush_subtitle().await;
+                    let mut runtime = session.runtime.lock().await;
+                    if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
+                        let finished = tokio::select! {
+                            _ = cancellation.cancelled() => return,
+                            result = output.finish() => result,
+                        };
+                        if let Err(error) = finished {
+                            session.emit(SessionEventKind::Warning {
+                                code: "tts_finish".into(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                    drop(runtime);
+                    if let Err(error) = wait_for_playback_drain(&session, &cancellation).await {
+                        if !cancellation.is_cancelled()
+                            && session.epoch.load(Ordering::Acquire) == drain_epoch
+                        {
+                            session
+                                .fault("playback_drain", error.to_string(), true)
+                                .await;
+                        }
+                        return;
+                    }
+                    if cancellation.is_cancelled()
+                        || session.epoch.load(Ordering::Acquire) != drain_epoch
+                    {
+                        return;
+                    }
+                    if let Err(error) = session.stop_capture_with_operation(None, &operation).await
+                    {
+                        tracing::warn!("failed to stop drained session: {error}");
+                    }
+                });
+                break;
             }
             SourceEvent::Warning(message) => {
                 session.emit(SessionEventKind::Warning {
@@ -1359,6 +1909,206 @@ async fn forward_source(
             }
         }
     }
+}
+
+async fn forward_model_block(
+    session: &Arc<Session>,
+    block: AudioFrame,
+    queue_policy: &QueuePolicy,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut block = block;
+    if block.payload.len() < 25_600 {
+        block.payload.resize(25_600, 0);
+        block.format.frame_duration_us = MODEL_BLOCK_US;
+    }
+    loop {
+        let backlog = {
+            let metrics = session.metrics.lock().await;
+            metrics
+                .sent_duration_us
+                .saturating_sub(metrics.completed_duration_us)
+        };
+        if backlog <= queue_policy.max_model_backlog_us as u64 {
+            break;
+        }
+        match queue_policy.overflow_behavior {
+            OverflowBehavior::BlockProducer => {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(CoreError::InvalidState("audio backpressure was cancelled".into()));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+            }
+            OverflowBehavior::FailSession => {
+                return Err(CoreError::InvalidState(format!(
+                    "model backlog exceeded the configured limit at {backlog} us"
+                )));
+            }
+            OverflowBehavior::DropOldestAudio | OverflowBehavior::SkipStaleSpeech => {
+                reset_stale_backlog(
+                    session,
+                    backlog,
+                    matches!(
+                        queue_policy.overflow_behavior,
+                        OverflowBehavior::SkipStaleSpeech
+                    ),
+                    cancellation,
+                )
+                .await?;
+                break;
+            }
+            OverflowBehavior::DropNewestAudio => {
+                let mut metrics = session.metrics.lock().await;
+                metrics.dropped_frames += 1;
+                metrics.dropped_duration_us += block.duration_us as u64;
+                drop(metrics);
+                session.emit(SessionEventKind::Warning {
+                    code: "backlog_overflow".into(),
+                    message: format!("dropped one audio block at {backlog} us backlog"),
+                });
+                return Ok(());
+            }
+        }
+    }
+    let mut runtime = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(CoreError::InvalidState("model write was cancelled".into()));
+        }
+        guard = session.runtime.lock() => guard,
+    };
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(CoreError::InvalidState("model write was cancelled".into()));
+        }
+        result = async {
+            match runtime.as_mut().and_then(|r| r.translator.as_mut()) {
+                Some(translator) => translator.push_audio(block.clone()).await,
+                None => Err(CoreError::InvalidState("translator unavailable".into())),
+            }
+        } => result,
+    };
+    drop(runtime);
+    result?;
+    let mut metrics = session.metrics.lock().await;
+    metrics.sent_frames += 1;
+    metrics.sent_duration_us += block.duration_us as u64;
+    metrics.model_backlog_us = metrics
+        .sent_duration_us
+        .saturating_sub(metrics.completed_duration_us);
+    Ok(())
+}
+
+async fn reset_stale_backlog(
+    session: &Arc<Session>,
+    backlog_us: u64,
+    flush_speech: bool,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let mut runtime = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(CoreError::InvalidState("stale backlog reset was cancelled".into()));
+        }
+        guard = session.runtime.lock() => guard,
+    };
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(CoreError::InvalidState("stale backlog reset was cancelled".into()));
+        }
+        result = async {
+            let runtime = runtime
+                .as_mut()
+                .ok_or_else(|| CoreError::InvalidState("runtime missing".into()))?;
+            let translator = runtime
+                .translator
+                .as_mut()
+                .ok_or_else(|| CoreError::InvalidState("translator missing".into()))?;
+            translator.reset_source().await?;
+            if flush_speech
+                && let Some(output) = runtime.output.as_mut()
+            {
+                output.flush().await?;
+            }
+            Ok::<(), CoreError>(())
+        } => result,
+    };
+    drop(runtime);
+    result?;
+
+    let captured_duration_us = session.metrics.lock().await.captured_duration_us;
+    session.timeline_offset_ns.store(
+        captured_duration_us.saturating_mul(1_000),
+        Ordering::Release,
+    );
+    if flush_speech {
+        session.playback.lock().await.clear();
+    }
+    {
+        let mut metrics = session.metrics.lock().await;
+        metrics.sent_duration_us = 0;
+        metrics.completed_duration_us = 0;
+        metrics.model_backlog_us = 0;
+        metrics.dropped_frames += 1;
+        metrics.dropped_duration_us = metrics.dropped_duration_us.saturating_add(backlog_us);
+        if flush_speech {
+            metrics.playback_pending = 0;
+            metrics.tts_queue_depth = 0;
+        }
+    }
+    session.emit(SessionEventKind::Warning {
+        code: "stale_backlog_dropped".into(),
+        message: format!(
+            "dropped {backlog_us} us of stale model backlog and resumed at the live edge"
+        ),
+    });
+    Ok(())
+}
+
+async fn wait_for_model_drain(
+    session: &Arc<Session>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let metrics = session.metrics.lock().await.clone();
+            if metrics.completed_duration_us >= metrics.sent_duration_us {
+                break;
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(CoreError::InvalidState("model drain was cancelled".into()));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| CoreError::Translator("model drain timed out".into()))?
+}
+
+async fn wait_for_playback_drain(
+    session: &Arc<Session>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let metrics = session.metrics.lock().await.clone();
+            if metrics.tts_queue_depth == 0 && metrics.playback_pending == 0 {
+                break;
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err(CoreError::InvalidState("playback drain was cancelled".into()));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| CoreError::Output("playback drain timed out".into()))?
 }
 
 #[cfg(test)]
@@ -1376,6 +2126,27 @@ mod tests {
         })
         .await
         .expect("state transition timed out");
+    }
+
+    #[test]
+    fn playback_ledger_tolerates_out_of_order_and_duplicate_events() {
+        let mut ledger = PlaybackLedger::default();
+        let terminal = ledger.apply(1, PlaybackEventType::Finished);
+        assert_eq!(terminal.pending, 0);
+        assert!(terminal.count_event);
+        assert!(!ledger.apply(1, PlaybackEventType::Queued).count_event);
+        assert_eq!(ledger.apply(1, PlaybackEventType::Started).pending, 0);
+        assert_eq!(ledger.apply(2, PlaybackEventType::Queued).pending, 1);
+        assert_eq!(ledger.apply(2, PlaybackEventType::Queued).pending, 1);
+        assert_eq!(ledger.apply(2, PlaybackEventType::Started).pending, 1);
+        let finished = ledger.apply(2, PlaybackEventType::Finished);
+        assert_eq!(finished.pending, 0);
+        assert!(finished.count_event);
+        assert!(!ledger.apply(2, PlaybackEventType::Finished).count_event);
+        for token in 10..1_000 {
+            ledger.apply(token, PlaybackEventType::Finished);
+        }
+        assert!(ledger.states.len() <= 64);
     }
 
     #[tokio::test]
@@ -1405,8 +2176,24 @@ mod tests {
         wait_for_state(&session, SessionState::Ready).await;
         let snapshot = session.snapshot().await;
         assert!(snapshot.metrics.translations >= 1);
-        assert_eq!(snapshot.epoch, 1);
-        assert!(session.history().await.iter().all(|cue| cue.is_final));
+        assert!(snapshot.epoch > 1);
+        let history = session.history().await;
+        assert!(history.iter().all(|cue| cue.is_final));
+        assert!(history.windows(2).all(|pair| {
+            pair[0].source_start_ns <= pair[1].source_start_ns
+                && pair[0].source_end_ns <= pair[1].source_end_ns
+        }));
+        let segment_ids = history
+            .iter()
+            .flat_map(|cue| cue.segment_ids.iter())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            segment_ids.len(),
+            history
+                .iter()
+                .map(|cue| cue.segment_ids.len())
+                .sum::<usize>()
+        );
         session.start().await.unwrap();
         session.stop().await.unwrap();
         session.stop_model().await.unwrap();
@@ -1422,6 +2209,773 @@ mod tests {
             }
         }
         assert!(saw_translation && saw_subtitle);
+    }
+
+    #[tokio::test]
+    async fn concurrent_prepare_and_start_are_single_flight() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        let mut prepares = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let session = Arc::clone(&session);
+            prepares.spawn(async move { session.prepare().await });
+        }
+        while let Some(result) = prepares.join_next().await {
+            result.unwrap().unwrap();
+        }
+        wait_for_state(&session, SessionState::Ready).await;
+
+        let mut starts = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let session = Arc::clone(&session);
+            starts.spawn(async move { session.start().await });
+        }
+        let mut succeeded = 0;
+        while let Some(result) = starts.join_next().await {
+            if result.unwrap().is_ok() {
+                succeeded += 1;
+            }
+        }
+        assert_eq!(succeeded, 1);
+        {
+            let guard = session.runtime.lock().await;
+            let runtime = guard.as_ref().unwrap();
+            assert_eq!(runtime.translator.as_ref().map(|_| 1).unwrap_or(0), 1);
+            assert_eq!(runtime.source.as_ref().map(|_| 1).unwrap_or(0), 1);
+            assert_eq!(runtime.output.as_ref().map(|_| 1).unwrap_or(0), 1);
+        }
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_blocked_model_write() {
+        struct BlockingTranslator {
+            entered: Arc<tokio::sync::Notify>,
+            stopped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl RunningTranslator for BlockingTranslator {
+            async fn push_audio(&mut self, _frame: AudioFrame) -> Result<()> {
+                self.entered.notify_one();
+                std::future::pending::<Result<()>>().await
+            }
+
+            async fn recover(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn reset_source(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn reattach(
+                &mut self,
+                _session_id: Uuid,
+                _epoch: u64,
+                _sender: mpsc::Sender<TranslatorSignal>,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn set_direction(&mut self, _direction: &str) -> Result<()> {
+                Ok(())
+            }
+
+            async fn stop(&mut self) -> Result<()> {
+                self.stopped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *session.runtime.lock().await = Some(Runtime {
+            translator: Some(Box::new(BlockingTranslator {
+                entered: Arc::clone(&entered),
+                stopped: Arc::clone(&stopped),
+            })),
+            output: None,
+            source: None,
+            translator_task: None,
+            output_task: None,
+            source_task: None,
+        });
+        *session.state.lock().await = SessionState::Running;
+        let operation = session.lifecycle.begin().await;
+        let cancellation = operation.token();
+        drop(operation);
+        let (sender, receiver) = mpsc::channel(2);
+        let task = tokio::spawn(forward_source(
+            Arc::downgrade(&session),
+            receiver,
+            QueuePolicy::default(),
+            cancellation,
+        ));
+        sender
+            .send(SourceEvent::Frame(AudioFrame {
+                session_id: session.id,
+                epoch: 1,
+                sequence: 0,
+                source_id: "test".into(),
+                format: AudioFormat {
+                    frame_duration_us: MODEL_BLOCK_US,
+                    ..AudioFormat::default()
+                },
+                payload: vec![0; 25_600],
+                source_pts_ns: None,
+                capture_mono_ns: 0,
+                ingress_mono_ns: 0,
+                duration_us: MODEL_BLOCK_US,
+                discontinuity: false,
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), session.stop_model())
+            .await
+            .expect("blocked model write prevented stop")
+            .unwrap();
+        assert!(stopped.load(std::sync::atomic::Ordering::Acquire));
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn recovery_and_stop_cannot_leave_capture_resources_behind() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        for _ in 0..10 {
+            session.start().await.unwrap();
+            let recovering = {
+                let session = Arc::clone(&session);
+                tokio::spawn(async move { session.recover_output().await })
+            };
+            let stopping = {
+                let session = Arc::clone(&session);
+                tokio::spawn(async move { session.stop().await })
+            };
+            let _ = recovering.await.unwrap();
+            stopping.await.unwrap().unwrap();
+            wait_for_state(&session, SessionState::Ready).await;
+            let guard = session.runtime.lock().await;
+            let runtime = guard.as_ref().unwrap();
+            assert!(runtime.source.is_none());
+            assert!(runtime.output.is_none());
+        }
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_pause_does_not_cancel_preparing() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        *session.state.lock().await = SessionState::Preparing;
+        let operation = session.lifecycle.begin().await;
+        let token = operation.token();
+        drop(operation);
+        assert!(session.pause().await.is_err());
+        assert!(!token.is_cancelled());
+        assert_eq!(session.snapshot().await.state, SessionState::Preparing);
+    }
+
+    #[tokio::test]
+    async fn paused_source_change_does_not_restart_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        session.start().await.unwrap();
+        session.pause().await.unwrap();
+        session
+            .set_source(SourceConfig::Mock { frames: Some(1) }, true)
+            .await
+            .unwrap();
+        let guard = session.runtime.lock().await;
+        let runtime = guard.as_ref().unwrap();
+        assert!(runtime.source.is_none());
+        assert!(runtime.output.is_none());
+        drop(guard);
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configuring_session_cannot_be_bypassed_for_model_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::new(CoreOptions {
+            audio_host: "unused".into(),
+            runtime_dir: root.path().to_string_lossy().into_owned(),
+        });
+        let first = manager.create(PipelineConfig::default()).await;
+        manager.prepare(first.id).await.unwrap();
+        wait_for_state(&first, SessionState::Ready).await;
+        *first.state.lock().await = SessionState::Configuring;
+        let second = manager.create(PipelineConfig::default()).await;
+        manager.prepare(second.id).await.unwrap();
+        wait_for_state(&second, SessionState::Ready).await;
+        assert_eq!(first.snapshot().await.state, SessionState::Idle);
+        assert!(
+            first
+                .runtime
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|runtime| runtime.translator.is_none())
+        );
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_drain_cannot_stop_a_later_run() {
+        struct QuietTranslator;
+
+        #[async_trait::async_trait]
+        impl RunningTranslator for QuietTranslator {
+            async fn push_audio(&mut self, _frame: AudioFrame) -> Result<()> {
+                Ok(())
+            }
+            async fn recover(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn reset_source(&mut self) -> Result<()> {
+                Ok(())
+            }
+            async fn reattach(
+                &mut self,
+                _session_id: Uuid,
+                _epoch: u64,
+                _sender: mpsc::Sender<TranslatorSignal>,
+            ) -> Result<()> {
+                Ok(())
+            }
+            async fn set_direction(&mut self, _direction: &str) -> Result<()> {
+                Ok(())
+            }
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: Some(1) },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        *session.runtime.lock().await = Some(Runtime {
+            translator: Some(Box::new(QuietTranslator)),
+            output: None,
+            source: None,
+            translator_task: None,
+            output_task: None,
+            source_task: None,
+        });
+        *session.state.lock().await = SessionState::Ready;
+        session.start().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.snapshot().await.metrics.sent_duration_us == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session.stop().await.unwrap();
+        session
+            .set_source(SourceConfig::Mock { frames: None }, true)
+            .await
+            .unwrap();
+        session.start().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.snapshot().await.state, SessionState::Running);
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_ahead_policy_resets_to_the_live_edge() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        *session.state.lock().await = SessionState::Running;
+        {
+            let mut metrics = session.metrics.lock().await;
+            metrics.sent_duration_us = 20_000_000;
+            metrics.captured_duration_us = 20_000_000;
+        }
+        let policy = QueuePolicy {
+            max_model_backlog_us: 10_000_000,
+            overflow_behavior: OverflowBehavior::DropOldestAudio,
+            ..QueuePolicy::default()
+        };
+        let result = forward_model_block(
+            &session,
+            AudioFrame {
+                session_id: session.id,
+                epoch: 1,
+                sequence: 0,
+                source_id: "test".into(),
+                format: AudioFormat {
+                    frame_duration_us: MODEL_BLOCK_US,
+                    ..AudioFormat::default()
+                },
+                payload: vec![0; 25_600],
+                source_pts_ns: None,
+                capture_mono_ns: 0,
+                ingress_mono_ns: 0,
+                duration_us: MODEL_BLOCK_US,
+                discontinuity: false,
+            },
+            &policy,
+            &CancellationToken::new(),
+        )
+        .await;
+        result.unwrap();
+        let snapshot = session.snapshot().await;
+        assert_eq!(snapshot.metrics.dropped_frames, 1);
+        assert_eq!(snapshot.metrics.dropped_duration_us, 20_000_000);
+        assert_eq!(snapshot.metrics.sent_duration_us, 800_000);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.history().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(session.history().await[0].source_start_ns, 20_000_000_000);
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn competing_sessions_share_one_preparing_model() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(SessionManager::new(CoreOptions {
+            audio_host: "unused".into(),
+            runtime_dir: root.path().to_string_lossy().into_owned(),
+        }));
+        let first = manager.create(PipelineConfig::default()).await;
+        let second = manager.create(PipelineConfig::default()).await;
+        let mut prepares = tokio::task::JoinSet::new();
+        for id in [first.id, second.id] {
+            let manager = Arc::clone(&manager);
+            prepares.spawn(async move { manager.prepare(id).await });
+        }
+        while let Some(result) = prepares.join_next().await {
+            result.unwrap().unwrap();
+        }
+        let mut resident_models = 0;
+        for session in [first, second] {
+            if session
+                .runtime
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|runtime| runtime.translator.is_some())
+            {
+                resident_models += 1;
+            }
+        }
+        assert_eq!(resident_models, 1);
+        manager.stop_all().await;
+    }
+
+    #[tokio::test]
+    async fn stale_translation_is_rejected_after_a_new_run_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        session.start().await.unwrap();
+        let old_epoch = session.snapshot().await.epoch;
+        session.stop().await.unwrap();
+        session.start().await.unwrap();
+        let new_epoch = session.snapshot().await.epoch;
+        assert!(new_epoch > old_epoch);
+
+        let (sender, receiver) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(forward_translator(
+            Arc::downgrade(&session),
+            receiver,
+            cancellation.clone(),
+        ));
+        sender
+            .send(TranslatorSignal::Translation(test_translation(
+                session.id,
+                old_epoch,
+                "stale-run",
+                "must not appear",
+            )))
+            .await
+            .unwrap();
+        sender
+            .send(TranslatorSignal::Translation(test_translation(
+                session.id,
+                new_epoch,
+                "fresh-run",
+                "fresh content",
+            )))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session
+                    .history()
+                    .await
+                    .iter()
+                    .any(|cue| cue.segment_ids.iter().any(|id| id.ends_with("fresh-run")))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            session
+                .history()
+                .await
+                .iter()
+                .all(|cue| { cue.segment_ids.iter().all(|id| !id.ends_with("stale-run")) })
+        );
+        cancellation.cancel();
+        let _ = task.await;
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn translation_events_use_their_own_source_generation_timeline() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        *session.state.lock().await = SessionState::Running;
+        session
+            .timeline_offsets
+            .lock()
+            .await
+            .insert((1, 1), 10_000_000_000);
+        session
+            .timeline_offset_ns
+            .store(20_000_000_000, Ordering::Release);
+        let (sender, receiver) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(forward_translator(
+            Arc::downgrade(&session),
+            receiver,
+            cancellation.clone(),
+        ));
+        let mut old = test_translation(session.id, 1, "old", "old.");
+        old.source_generation = 1;
+        old.speakable = false;
+        sender
+            .send(TranslatorSignal::Translation(old))
+            .await
+            .unwrap();
+        sender
+            .send(TranslatorSignal::SourceReset {
+                epoch: 1,
+                source_generation: 2,
+            })
+            .await
+            .unwrap();
+        let mut new = test_translation(session.id, 1, "new", "new.");
+        new.source_generation = 2;
+        new.speakable = false;
+        sender
+            .send(TranslatorSignal::Translation(new))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.history().await.len() < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let history = session.history().await;
+        assert_eq!(history[0].source_start_ns, 10_000_000_000);
+        assert_eq!(history[1].source_start_ns, 20_000_000_000);
+        assert!(history[0].segment_ids[0].contains("source-1-"));
+        assert!(history[1].segment_ids[0].contains("source-2-"));
+        cancellation.cancel();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn speech_arriving_during_output_recovery_is_submitted_after_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        session.start().await.unwrap();
+        let (output, mut source, source_task) = {
+            let mut guard = session.runtime.lock().await;
+            let runtime = guard.as_mut().unwrap();
+            (
+                runtime.output.take().unwrap(),
+                runtime.source.take().unwrap(),
+                runtime.source_task.take().unwrap(),
+            )
+        };
+        source_task.abort();
+        let _ = source_task.await;
+        source.stop().await.unwrap();
+        session.pending_speech.lock().await.clear();
+        let before = session.snapshot().await.metrics.playback_finished;
+
+        let (sender, receiver) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(forward_translator(
+            Arc::downgrade(&session),
+            receiver,
+            cancellation.clone(),
+        ));
+        sender
+            .send(TranslatorSignal::Translation(test_translation(
+                session.id,
+                session.snapshot().await.epoch,
+                "during-recovery",
+                "queued during recovery",
+            )))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.pending_speech.lock().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        session.runtime.lock().await.as_mut().unwrap().output = Some(output);
+        let operation = session.lifecycle.begin().await;
+        session.flush_pending_speech(&operation).await.unwrap();
+        drop(operation);
+        assert!(session.pending_speech.lock().await.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.snapshot().await.metrics.playback_finished <= before {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        let _ = task.await;
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_history_and_new_uuid_cues_coexist() {
+        let root = tempfile::tempdir().unwrap();
+        let options = CoreOptions {
+            audio_host: "unused".into(),
+            runtime_dir: root.path().to_string_lossy().into_owned(),
+        };
+        let session = Session::new(PipelineConfig::default(), options.clone());
+        session
+            .record_subtitle(SubtitleCue {
+                cue_id: "cue-0".into(),
+                revision: 1,
+                source_text: "old source".into(),
+                translated_text: "old target".into(),
+                source_start_ns: 0,
+                source_end_ns: 1,
+                is_final: true,
+                segment_ids: vec!["old".into()],
+            })
+            .await;
+        let restored = Session::restore(
+            StoredSession {
+                id: session.id,
+                config: PipelineConfig::default(),
+                metadata: session.metadata.lock().await.clone(),
+            },
+            options,
+        );
+        let event = test_translation(session.id, 2, "new-run", "new content");
+        let cue = restored.subtitles.lock().await.push(&event);
+        assert_ne!(cue.cue_id, "cue-0");
+        assert_eq!(cue.cue_id.len(), 36);
+        restored.record_subtitle(cue).await;
+        let history = restored.history().await;
+        assert_eq!(history.len(), 2);
+        assert!(history.iter().any(|cue| cue.cue_id == "cue-0"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn model_exit_before_ready_faults_and_cleans_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("fake-model.py");
+        let model = root.path().join("model.gguf");
+        tokio::fs::write(
+            &executable,
+            "#!/usr/bin/env python3\nimport sys\nsys.exit(3)\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&model, b"test").await.unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                translator: TranslatorConfig::HySimulmt {
+                    executable: executable.to_string_lossy().into_owned(),
+                    model: model.to_string_lossy().into_owned(),
+                    direction: "en-zh".into(),
+                    context: Some(16_384),
+                    n_predict: Some(160),
+                },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Faulted).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while session.runtime.lock().await.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("model runtime was not cleaned after early exit");
+        assert!(session.snapshot().await.last_error.is_some());
+    }
+
+    #[tokio::test]
+    async fn finite_source_drains_tail_and_returns_to_ready() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: Some(1) },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+            },
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        session.start().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        let snapshot = session.snapshot().await;
+        assert_eq!(snapshot.metrics.sent_duration_us, 100_000);
+        assert_eq!(snapshot.metrics.playback_pending, 0);
+        assert_eq!(session.history().await[0].source_end_ns, 100_000_000);
+        assert!(snapshot.metrics.playback_finished >= 1);
+        assert!(session.history().await.iter().all(|cue| cue.is_final));
+        session.stop_model().await.unwrap();
+    }
+
+    fn test_translation(
+        session_id: Uuid,
+        epoch: u64,
+        segment_id: &str,
+        text: &str,
+    ) -> TranslationEvent {
+        TranslationEvent {
+            session_id,
+            epoch,
+            source_generation: 0,
+            segment_id: segment_id.into(),
+            revision: 0,
+            event_type: TranslationEventType::Append,
+            source_text: text.into(),
+            translated_text: text.into(),
+            source_start_ns: Some(0),
+            source_end_ns: Some(800_000_000),
+            generation_started_ns: 0,
+            generation_finished_ns: monotonic_ns(),
+            generation_duration_us: 0,
+            speakable: true,
+        }
     }
 
     #[tokio::test]

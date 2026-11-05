@@ -123,7 +123,20 @@ async fn main() {
     tracing::info!("SimulMT listening on http://{address}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
             manager.stop_all().await;
         })
         .await

@@ -1,4 +1,5 @@
 mod error;
+mod lifecycle;
 mod output;
 mod session;
 mod source;

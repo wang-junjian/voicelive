@@ -33,13 +33,18 @@ pub enum TranslatorSignal {
     },
     ContextRotated,
     ModelRestarted,
-    SourceReset,
+    SourceReset {
+        epoch: u64,
+        source_generation: u64,
+    },
+    StreamEnded(String),
     Warning(String),
 }
 
 #[async_trait]
 pub trait RunningTranslator: Send {
     async fn push_audio(&mut self, frame: AudioFrame) -> Result<()>;
+    async fn recover(&mut self) -> Result<()>;
     async fn reset_source(&mut self) -> Result<()>;
     async fn reattach(
         &mut self,
@@ -65,6 +70,8 @@ struct MockTranslator {
     epoch: u64,
     sender: mpsc::Sender<TranslatorSignal>,
     index: u64,
+    timeline_us: u64,
+    source_generation: u64,
 }
 
 #[async_trait]
@@ -73,6 +80,26 @@ impl RunningTranslator for MockTranslator {
         let now = monotonic_ns();
         let index = self.index;
         self.index += 1;
+        let source_start_ns = self.timeline_us.saturating_mul(1_000) as i64;
+        self.timeline_us = self.timeline_us.saturating_add(frame.duration_us as u64);
+        let source_end_ns = self.timeline_us.saturating_mul(1_000) as i64;
+        let event = TranslationEvent {
+            session_id: self.session_id,
+            epoch: self.epoch,
+            source_generation: self.source_generation,
+            segment_id: format!("mock-{index}"),
+            revision: 0,
+            event_type: TranslationEventType::Append,
+            source_text: format!("Mock source segment {index}"),
+            translated_text: format!("模拟译文片段 {index}"),
+            source_start_ns: Some(source_start_ns),
+            source_end_ns: Some(source_end_ns),
+            generation_started_ns: now,
+            generation_finished_ns: monotonic_ns(),
+            generation_duration_us: 50,
+            speakable: true,
+        };
+        let _ = self.sender.send(TranslatorSignal::Translation(event)).await;
         let _ = self
             .sender
             .send(TranslatorSignal::Completed {
@@ -80,27 +107,24 @@ impl RunningTranslator for MockTranslator {
                 context_position: index as u32,
             })
             .await;
-        let event = TranslationEvent {
-            session_id: self.session_id,
-            epoch: self.epoch,
-            segment_id: format!("mock-{index}"),
-            revision: 0,
-            event_type: TranslationEventType::Append,
-            source_text: format!("Mock source segment {index}"),
-            translated_text: format!("模拟译文片段 {index}"),
-            source_start_ns: Some((index * frame.duration_us as u64 * 1_000) as i64),
-            source_end_ns: Some(((index + 1) * frame.duration_us as u64 * 1_000) as i64),
-            generation_started_ns: now,
-            generation_finished_ns: monotonic_ns(),
-            generation_duration_us: 50,
-            speakable: true,
-        };
-        let _ = self.sender.send(TranslatorSignal::Translation(event)).await;
+        Ok(())
+    }
+
+    async fn recover(&mut self) -> Result<()> {
         Ok(())
     }
 
     async fn reset_source(&mut self) -> Result<()> {
-        let _ = self.sender.send(TranslatorSignal::SourceReset).await;
+        self.source_generation += 1;
+        self.index = 0;
+        self.timeline_us = 0;
+        let _ = self
+            .sender
+            .send(TranslatorSignal::SourceReset {
+                epoch: self.epoch,
+                source_generation: self.source_generation,
+            })
+            .await;
         Ok(())
     }
 
@@ -114,7 +138,8 @@ impl RunningTranslator for MockTranslator {
         self.epoch = epoch;
         self.sender = sender;
         self.index = 0;
-        Ok(())
+        self.timeline_us = 0;
+        self.reset_source().await
     }
 
     async fn set_direction(&mut self, _direction: &str) -> Result<()> {
@@ -144,6 +169,15 @@ struct HandoffTurn {
 
 type SharedHandoff = Arc<std::sync::Mutex<VecDeque<HandoffTurn>>>;
 type SharedPendingAudio = Arc<std::sync::Mutex<VecDeque<AudioFrame>>>;
+
+struct HyShared {
+    route: SharedRoute,
+    rotate_requested: Arc<AtomicBool>,
+    handoff: SharedHandoff,
+    pending_audio: SharedPendingAudio,
+    timeline_us: Arc<AtomicU64>,
+    source_generation: Arc<AtomicU64>,
+}
 
 struct HyProcess {
     child: Child,
@@ -187,12 +221,14 @@ impl HyTranslator {
         self.process = spawn_hy_process(
             &self.config,
             self.generation,
-            Arc::clone(&self.route),
-            Arc::clone(&self.rotate_requested),
-            Arc::clone(&self.handoff),
-            Arc::clone(&self.pending_audio),
-            Arc::clone(&self.timeline_us),
-            Arc::clone(&self.source_generation),
+            HyShared {
+                route: Arc::clone(&self.route),
+                rotate_requested: Arc::clone(&self.rotate_requested),
+                handoff: Arc::clone(&self.handoff),
+                pending_audio: Arc::clone(&self.pending_audio),
+                timeline_us: Arc::clone(&self.timeline_us),
+                source_generation: Arc::clone(&self.source_generation),
+            },
         )
         .await?;
         let replay = self
@@ -263,6 +299,10 @@ impl RunningTranslator for HyTranslator {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn recover(&mut self) -> Result<()> {
+        self.restart("model stream ended").await
     }
 
     async fn reset_source(&mut self) -> Result<()> {
@@ -362,6 +402,8 @@ pub async fn start_translator(
                 epoch,
                 sender,
                 index: 0,
+                timeline_us: 0,
+                source_generation: 0,
             }))
         }
         TranslatorConfig::HySimulmt {
@@ -409,12 +451,14 @@ async fn start_hy(
     let process = spawn_hy_process(
         &config,
         0,
-        Arc::clone(&route),
-        Arc::clone(&rotate_requested),
-        Arc::clone(&handoff),
-        Arc::clone(&pending_audio),
-        Arc::clone(&timeline_us),
-        Arc::clone(&source_generation),
+        HyShared {
+            route: Arc::clone(&route),
+            rotate_requested: Arc::clone(&rotate_requested),
+            handoff: Arc::clone(&handoff),
+            pending_audio: Arc::clone(&pending_audio),
+            timeline_us: Arc::clone(&timeline_us),
+            source_generation: Arc::clone(&source_generation),
+        },
     )
     .await?;
     Ok(HyTranslator {
@@ -451,13 +495,16 @@ async fn write_stream_frame(
 async fn spawn_hy_process(
     config: &HyConfig,
     generation: u64,
-    route: SharedRoute,
-    rotate_requested: Arc<AtomicBool>,
-    handoff: SharedHandoff,
-    pending_audio: SharedPendingAudio,
-    timeline_us: Arc<AtomicU64>,
-    source_generation: Arc<AtomicU64>,
+    shared: HyShared,
 ) -> Result<HyProcess> {
+    let HyShared {
+        route,
+        rotate_requested,
+        handoff,
+        pending_audio,
+        timeline_us,
+        source_generation,
+    } = shared;
     let prompt = build_prompt(&config.direction, &handoff)?;
     tokio::fs::create_dir_all(&config.runtime_dir).await?;
     let log_path = Path::new(&config.runtime_dir).join("model.log");
@@ -474,6 +521,7 @@ async fn spawn_hy_process(
         .arg("0")
         .arg("-p")
         .arg(prompt)
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -512,18 +560,13 @@ async fn spawn_hy_process(
                         continue;
                     }
                     let duration_us = message.ms.unwrap_or(800) * 1_000;
-                    acknowledge_audio(&pending_audio, duration_us as u64);
+                    let acknowledged_duration_us =
+                        acknowledge_audio(&pending_audio, duration_us as u64);
                     let source_start_ns = (timeline_us
-                        .fetch_add(duration_us as u64, Ordering::AcqRel)
+                        .fetch_add(acknowledged_duration_us, Ordering::AcqRel)
                         * 1_000) as i64;
                     let source_end_ns = (timeline_us.load(Ordering::Acquire) * 1_000) as i64;
                     let position = message.pos.unwrap_or(0);
-                    let _ = sender
-                        .send(TranslatorSignal::Completed {
-                            duration_us,
-                            context_position: position,
-                        })
-                        .await;
                     let src = message.src.unwrap_or_default().trim().to_string();
                     let tgt = message.tgt.unwrap_or_default().trim().to_string();
                     if !src.is_empty() || !tgt.is_empty() {
@@ -541,6 +584,7 @@ async fn spawn_hy_process(
                         let event = TranslationEvent {
                             session_id,
                             epoch,
+                            source_generation: message.source_generation.unwrap_or(0),
                             segment_id: format!("hy-{generation}-{index}"),
                             revision: 0,
                             event_type: TranslationEventType::Append,
@@ -556,6 +600,12 @@ async fn spawn_hy_process(
                         };
                         let _ = sender.send(TranslatorSignal::Translation(event)).await;
                     }
+                    let _ = sender
+                        .send(TranslatorSignal::Completed {
+                            duration_us: acknowledged_duration_us.min(u32::MAX as u64) as u32,
+                            context_position: position,
+                        })
+                        .await;
                 }
                 Ok(message) if message.kind == "rotate" => {
                     if message.source_generation.unwrap_or(0)
@@ -581,7 +631,12 @@ async fn spawn_hy_process(
                     if message.source_generation.unwrap_or(0)
                         == source_generation.load(Ordering::Acquire)
                     {
-                        let _ = sender.send(TranslatorSignal::SourceReset).await;
+                        let _ = sender
+                            .send(TranslatorSignal::SourceReset {
+                                epoch,
+                                source_generation: message.source_generation.unwrap_or(0),
+                            })
+                            .await;
                     }
                 }
                 Ok(message) if message.kind == "done" => {
@@ -601,7 +656,7 @@ async fn spawn_hy_process(
                 .sender
                 .clone();
             let _ = sender
-                .send(TranslatorSignal::Warning(
+                .send(TranslatorSignal::StreamEnded(
                     "model stream ended; the next audio block will trigger recovery".into(),
                 ))
                 .await;
@@ -687,7 +742,8 @@ async fn log_model_stderr(stderr: ChildStderr, path: PathBuf) {
     }
 }
 
-fn acknowledge_audio(pending_audio: &SharedPendingAudio, mut duration_us: u64) {
+fn acknowledge_audio(pending_audio: &SharedPendingAudio, mut duration_us: u64) -> u64 {
+    let mut acknowledged_us = 0_u64;
     let mut pending = pending_audio
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -701,16 +757,19 @@ fn acknowledge_audio(pending_audio: &SharedPendingAudio, mut duration_us: u64) {
             continue;
         }
         if duration_us >= front_duration {
+            acknowledged_us += front_duration;
             duration_us -= front_duration;
             pending.pop_front();
             continue;
         }
+        acknowledged_us += duration_us;
         let consumed_bytes = (front.payload.len() as u64 * duration_us / front_duration) as usize;
         let consumed_bytes = consumed_bytes - consumed_bytes % 2;
         front.payload.drain(..consumed_bytes);
         front.duration_us -= duration_us as u32;
         duration_us = 0;
     }
+    acknowledged_us
 }
 
 fn build_prompt(direction: &str, handoff: &SharedHandoff) -> Result<String> {
@@ -872,10 +931,10 @@ while True:
     async fn wait_for_invocations(path: &Path, expected: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if let Ok(contents) = tokio::fs::read_to_string(path).await {
-                    if contents.lines().count() >= expected {
-                        return;
-                    }
+                if let Ok(contents) = tokio::fs::read_to_string(path).await
+                    && contents.lines().count() >= expected
+                {
+                    return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -902,7 +961,7 @@ while True:
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match receiver.recv().await {
-                    Some(TranslatorSignal::SourceReset) => return,
+                    Some(TranslatorSignal::SourceReset { .. }) => return,
                     Some(_) => {}
                     None => panic!("translator channel closed"),
                 }
@@ -910,6 +969,14 @@ while True:
         })
         .await
         .expect("source reset timed out");
+    }
+
+    #[test]
+    fn acknowledgement_uses_valid_tail_duration_instead_of_model_padding() {
+        let pending = SharedPendingAudio::default();
+        pending.lock().unwrap().push_back(audio(0));
+        assert_eq!(acknowledge_audio(&pending, 800_000), 100_000);
+        assert!(pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

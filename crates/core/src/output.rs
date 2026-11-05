@@ -19,6 +19,7 @@ pub enum OutputSignal {
     QueueDepth(u32),
     Warning(String),
     Error(String),
+    DrainBarrier(tokio::sync::oneshot::Sender<()>),
     Exited,
 }
 
@@ -55,20 +56,31 @@ impl OutputRunner {
                 cache_dir,
                 voice,
                 speech_rate,
-            } => MacOutput::start(
-                player_path,
-                cache_dir,
-                voice.clone(),
-                *speech_rate,
+            } => MacOutput::start(MacOutputStart {
+                player_path: player_path.clone(),
+                cache_dir: cache_dir.clone(),
+                voice: voice.clone(),
+                speech_rate: *speech_rate,
                 latency_mode,
                 session_id,
                 epoch,
                 sender,
-            )
+            })
             .await
             .map(|output| Box::new(output) as Box<dyn PlaybackControl>),
         }
     }
+}
+
+async fn finish_barrier(sender: &mpsc::Sender<OutputSignal>) -> Result<()> {
+    let (ack, completed) = tokio::sync::oneshot::channel();
+    sender
+        .send(OutputSignal::DrainBarrier(ack))
+        .await
+        .map_err(|_| CoreError::Output("output event consumer stopped".into()))?;
+    completed
+        .await
+        .map_err(|_| CoreError::Output("output drain barrier was dropped".into()))
 }
 
 struct MockOutput {
@@ -111,7 +123,7 @@ impl PlaybackControl for MockOutput {
         Ok(())
     }
     async fn finish(&mut self) -> Result<()> {
-        Ok(())
+        finish_barrier(&self.sender).await
     }
     async fn pause(&mut self) -> Result<()> {
         Ok(())
@@ -131,7 +143,7 @@ enum OutputRequest {
     Speak(TranslationEvent),
     SetMode(LatencyMode),
     SetVoice(String),
-    Finish,
+    Finish(tokio::sync::oneshot::Sender<Result<()>>),
     Flush,
 }
 
@@ -248,6 +260,7 @@ struct MacOutput {
     worker: JoinHandle<()>,
     reader: JoinHandle<()>,
     queue: mpsc::Sender<OutputRequest>,
+    signal_sender: mpsc::Sender<OutputSignal>,
     pid: u32,
 }
 
@@ -279,24 +292,37 @@ struct PlayerEvent {
     depth: Option<u32>,
 }
 
+struct MacOutputStart {
+    player_path: String,
+    cache_dir: String,
+    voice: Option<String>,
+    speech_rate: Option<u32>,
+    latency_mode: LatencyMode,
+    session_id: Uuid,
+    epoch: u64,
+    sender: mpsc::Sender<OutputSignal>,
+}
+
 impl MacOutput {
-    async fn start(
-        player_path: &str,
-        cache_dir: &str,
-        voice: Option<String>,
-        speech_rate: Option<u32>,
-        latency_mode: LatencyMode,
-        session_id: Uuid,
-        epoch: u64,
-        sender: mpsc::Sender<OutputSignal>,
-    ) -> Result<Self> {
-        if !Path::new(player_path).exists() {
+    async fn start(options: MacOutputStart) -> Result<Self> {
+        let MacOutputStart {
+            player_path,
+            cache_dir,
+            voice,
+            speech_rate,
+            latency_mode,
+            session_id,
+            epoch,
+            sender,
+        } = options;
+        if !Path::new(&player_path).exists() {
             return Err(CoreError::InvalidConfig(format!(
                 "TTS player not found: {player_path}"
             )));
         }
-        tokio::fs::create_dir_all(cache_dir).await?;
-        let mut child = Command::new(player_path)
+        tokio::fs::create_dir_all(&cache_dir).await?;
+        let mut child = Command::new(&player_path)
+            .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -364,6 +390,21 @@ impl MacOutput {
                         .send(OutputSignal::QueueDepth(event.depth.unwrap_or(0)))
                         .await;
                 } else if event.kind == "error" {
+                    if token != 0 {
+                        let _ = reader_sender
+                            .send(OutputSignal::Playback(PlaybackEvent {
+                                event_type: PlaybackEventType::Failed,
+                                segment_id,
+                                token,
+                                queue_duration_us: 0,
+                                actual_start_mono_ns: None,
+                                source_end_ns: translation
+                                    .as_ref()
+                                    .and_then(|item| item.source_end_ns),
+                            }))
+                            .await;
+                        reader_segments.lock().await.remove(&token);
+                    }
                     let _ = reader_sender
                         .send(OutputSignal::Error(
                             event.message.unwrap_or_else(|| "player error".into()),
@@ -383,7 +424,7 @@ impl MacOutput {
         let (queue, mut receiver) = mpsc::channel::<OutputRequest>(32);
         let worker_writer = Arc::clone(&writer);
         let worker_sender = sender.clone();
-        let worker_cache = PathBuf::from(cache_dir);
+        let worker_cache = PathBuf::from(cache_dir.as_str());
         let mut worker_voice = voice.unwrap_or_else(|| "Tingting".into());
         let worker = tokio::spawn(async move {
             let mut next_token = 1_u64;
@@ -398,6 +439,8 @@ impl MacOutput {
                 next_token += 1;
             }
             while let Some(request) = receiver.recv().await {
+                let mut finish_ack = None;
+                let mut command_result = Ok(());
                 let event = match request {
                     OutputRequest::Speak(event)
                         if event.epoch == epoch
@@ -415,7 +458,10 @@ impl MacOutput {
                         worker_voice = voice;
                         None
                     }
-                    OutputRequest::Finish => assembler.finish(),
+                    OutputRequest::Finish(ack) => {
+                        finish_ack = Some(ack);
+                        assembler.finish()
+                    }
                     OutputRequest::Flush => {
                         assembler.clear();
                         None
@@ -444,18 +490,39 @@ impl MacOutput {
                         Ok(mut line) => {
                             line.push('\n');
                             let mut guard = worker_writer.lock().await;
-                            if let Err(error) = guard.write_all(line.as_bytes()).await {
-                                let _ = worker_sender
-                                    .send(OutputSignal::Error(error.to_string()))
-                                    .await;
+                            match guard.write_all(line.as_bytes()).await {
+                                Ok(()) => {
+                                    let _ = worker_sender
+                                        .send(OutputSignal::Playback(PlaybackEvent {
+                                            event_type: PlaybackEventType::Queued,
+                                            segment_id: event.segment_id.clone(),
+                                            token,
+                                            queue_duration_us: 0,
+                                            actual_start_mono_ns: None,
+                                            source_end_ns: event.source_end_ns,
+                                        }))
+                                        .await;
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    let _ = worker_sender
+                                        .send(OutputSignal::Error(message.clone()))
+                                        .await;
+                                    command_result = Err(CoreError::Output(message));
+                                }
                             }
                         }
                         Err(error) => {
+                            let message = error.to_string();
                             let _ = worker_sender
-                                .send(OutputSignal::Error(error.to_string()))
+                                .send(OutputSignal::Error(message.clone()))
                                 .await;
+                            command_result = Err(CoreError::Protocol(message));
                         }
                     }
+                }
+                if let Some(ack) = finish_ack {
+                    let _ = ack.send(command_result);
                 }
             }
         });
@@ -466,6 +533,7 @@ impl MacOutput {
             worker,
             reader,
             queue,
+            signal_sender: sender,
             pid,
         };
         // The player is a separate process and defaults to balanced. Send the
@@ -483,7 +551,7 @@ impl MacOutput {
                 latency_mode: Some(latency_mode_name(latency_mode)),
             })
             .await?;
-        output.prime(cache_dir).await?;
+        output.prime(&cache_dir).await?;
         Ok(output)
     }
 
@@ -574,11 +642,15 @@ impl PlaybackControl for MacOutput {
     }
 
     async fn finish(&mut self) -> Result<()> {
+        let (ack, completed) = tokio::sync::oneshot::channel();
         self.queue
-            .send(OutputRequest::Finish)
+            .send(OutputRequest::Finish(ack))
             .await
             .map_err(|_| CoreError::Output("TTS worker stopped".into()))?;
-        Ok(())
+        completed
+            .await
+            .map_err(|_| CoreError::Output("TTS worker dropped finish acknowledgement".into()))??;
+        finish_barrier(&self.signal_sender).await
     }
 
     async fn pause(&mut self) -> Result<()> {
@@ -659,6 +731,7 @@ mod tests {
         TranslationEvent {
             session_id: Uuid::nil(),
             epoch: 1,
+            source_generation: 0,
             segment_id: format!("segment-{index}"),
             revision: 0,
             event_type: TranslationEventType::Append,

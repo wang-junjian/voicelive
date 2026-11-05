@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos-mock:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --workspace --locked
+      - name: Build Core and native helpers
+        run: ./build.sh
+      - name: Run isolated HTTP acceptance
+        run: python3 tests/pipeline/acceptance_echonote.py
+      - name: Install browser test dependencies
+        run: |
+          npm ci
+          npx playwright install --no-shell chromium
+      - name: Run browser acceptance
+        run: npm run test:browser

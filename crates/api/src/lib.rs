@@ -108,9 +108,10 @@ impl Default for SourceConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TranslatorConfig {
+    #[default]
     Mock,
     HySimulmt {
         executable: String,
@@ -121,15 +122,10 @@ pub enum TranslatorConfig {
     },
 }
 
-impl Default for TranslatorConfig {
-    fn default() -> Self {
-        Self::Mock
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputConfig {
+    #[default]
     Mock,
     MacosSystem {
         player_path: String,
@@ -139,12 +135,6 @@ pub enum OutputConfig {
         /// Higher values shorten each segment and reduce playback backlog.
         speech_rate: Option<u32>,
     },
-}
-
-impl Default for OutputConfig {
-    fn default() -> Self {
-        Self::Mock
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +210,8 @@ pub enum TranslationEventType {
 pub struct TranslationEvent {
     pub session_id: Uuid,
     pub epoch: u64,
+    #[serde(default)]
+    pub source_generation: u64,
     pub segment_id: String,
     pub revision: u64,
     pub event_type: TranslationEventType,
@@ -284,6 +276,8 @@ pub struct SessionMetrics {
     pub playback_started: u64,
     pub playback_finished: u64,
     pub playback_cancelled: u64,
+    #[serde(default)]
+    pub playback_pending: u64,
     pub output_latency_us: u64,
     pub max_output_latency_us: u64,
     pub playback_lag_us: u64,
