@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARY = ROOT / "target/debug/simulmt-app"
@@ -27,19 +28,24 @@ def free_port():
 
 PORT = free_port()
 BASE = f"http://127.0.0.1:{PORT}"
+TOKEN = None
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def request(path, method="GET", body=None, raw=None, timeout=20):
+def request(path, method="GET", body=None, raw=None, timeout=20) -> Any:
     data = raw if raw is not None else (None if body is None else json.dumps(body).encode())
     content_type = "application/octet-stream" if raw is not None else "application/json"
+    headers = {"content-type": content_type}
+    if TOKEN:
+        headers["authorization"] = f"Bearer {TOKEN}"
     req = urllib.request.Request(
         BASE + path,
         data=data,
         method=method,
-        headers={"content-type": content_type},
+        headers=headers,
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with OPENER.open(req, timeout=timeout) as response:
             payload = response.read()
             if not payload:
                 return None
@@ -57,6 +63,8 @@ class Core:
         self.log = None
 
     def start(self):
+        global TOKEN
+        TOKEN = None
         log_path = self.runtime / "core.log"
         self.log = open(log_path, "ab")
         env = os.environ.copy()
@@ -73,11 +81,13 @@ class Core:
             if self.process.poll() is not None:
                 raise AssertionError(f"Core exited early:\n{log_path.read_text()}")
             try:
-                if request("/api/health", timeout=1)["status"] == "ok":
+                health = request("/api/health", timeout=1)
+                if health and health["status"] == "ok":
+                    TOKEN = json.loads((self.runtime / "bootstrap.json").read_text())["token"]
                     return
             except Exception:
                 time.sleep(0.1)
-        raise AssertionError("Core did not become healthy")
+        raise AssertionError(f"Core did not become healthy:\n{log_path.read_text()}")
 
     def stop(self):
         if self.process and self.process.poll() is None:
@@ -216,21 +226,27 @@ def main():
             export_config = mock_config()
             export_config["output"] = {
                 "type": "macos_system",
-                "player_path": str(ROOT / "target/native/simulmt-tts-host"),
-                "cache_dir": str(runtime / "cache"),
                 "voice": "Tingting",
                 "speech_rate": 220,
             }
             export_session = request("/api/sessions", "POST", export_config)
             export_id = export_session["session_id"]
+            core.stop()
             cache = runtime / "cache"
             cache.mkdir(exist_ok=True)
+            # Simulate a crash after the native player wrote WAV files but before
+            # Core persisted their speech rows. No legacy manifest is present.
             segment = cache / f"speech-{export_id}-1.wav"
+            third_segment = cache / f"speech-{export_id}-3.wav"
             segment.write_bytes(decoded.read_bytes())
+            third_segment.write_bytes(decoded.read_bytes())
+            core.start()
             exported = request(f"/api/sessions/{export_id}/export.wav")
-            assert exported.startswith(b"RIFF") and len(exported) > 44
+            assert exported.startswith(b"RIFF")
+            assert len(exported) > len(decoded.read_bytes())
             request(f"/api/sessions/{export_id}", "DELETE")
             assert not segment.exists()
+            assert not third_segment.exists()
 
             print(
                 json.dumps(

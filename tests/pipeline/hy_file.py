@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+from pathlib import Path
 import time
 import urllib.request
 
@@ -9,15 +10,29 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 _VENDOR = os.path.join(_PROJECT_ROOT, "vendor")
 DEMO = os.environ.get("SIMULMT_DEMO_ROOT", _VENDOR if os.path.isdir(os.path.join(_VENDOR, "models")) else os.path.dirname(_PROJECT_ROOT))
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TOKEN = os.environ.get("SIMULMT_TEST_TOKEN") or json.loads(Path(_PROJECT_ROOT, "runtime/bootstrap.json").read_text())["token"]
 
 def request(path, method="GET", body=None):
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(BASE + path, data=data, method=method, headers={"content-type": "application/json"})
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}"})
     with OPENER.open(req, timeout=30) as response:
         return json.load(response)
 
+def import_media(path):
+    with open(path, "rb") as source:
+        data = source.read()
+    req = urllib.request.Request(
+        BASE + "/api/media?name=input.wav",
+        data=data,
+        method="POST",
+        headers={"content-type": "application/octet-stream", "authorization": f"Bearer {TOKEN}"},
+    )
+    with OPENER.open(req, timeout=120) as response:
+        return json.load(response)["path"]
+
+
 config = request("/api/default-config")
-config["source"] = {"type": "file", "path": os.path.join(DEMO, "audio/test_en.wav"), "realtime": True}
+config["source"] = {"type": "file", "path": import_media(os.path.join(DEMO, "audio/test_en.wav")), "realtime": True}
 if os.environ.get("SIMULMT_TEST_OUTPUT") != "native":
     config["output"] = {"type": "mock"}
 session = request("/api/sessions", "POST", config)

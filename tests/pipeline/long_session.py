@@ -13,18 +13,36 @@ import wave
 ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE = ROOT.parent
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TOKEN = None
 
 
 def request(base, path, method="GET", body=None, timeout=30):
     data = None if body is None else json.dumps(body).encode()
+    headers = {"content-type": "application/json"}
+    if TOKEN:
+        headers["authorization"] = f"Bearer {TOKEN}"
     req = urllib.request.Request(
         base + path,
         data=data,
         method=method,
-        headers={"content-type": "application/json"},
+        headers=headers,
     )
     with OPENER.open(req, timeout=timeout) as response:
         return json.load(response)
+
+
+def import_media(base, path):
+    req = urllib.request.Request(
+        base + "/api/media?name=input.wav",
+        data=path.read_bytes(),
+        method="POST",
+        headers={
+            "content-type": "application/octet-stream",
+            "authorization": f"Bearer {TOKEN}",
+        },
+    )
+    with OPENER.open(req, timeout=300) as response:
+        return json.load(response)["path"]
 
 
 def wait_for(predicate, timeout, description):
@@ -56,6 +74,7 @@ def rss_kb(pid):
 
 
 def main():
+    global TOKEN
     parser = argparse.ArgumentParser()
     parser.add_argument("--seconds", type=int, default=1800)
     parser.add_argument("--port", type=int, default=8893)
@@ -99,8 +118,9 @@ def main():
                 stderr=subprocess.STDOUT,
             )
             wait_for(lambda: request(base, "/api/health", timeout=1).get("status") == "ok", 15, "core health")
+            TOKEN = json.loads((runtime_dir / "bootstrap.json").read_text())["token"]
             config = request(base, "/api/default-config")
-            config["source"] = {"type": "file", "path": str(input_path), "realtime": True}
+            config["source"] = {"type": "file", "path": import_media(base, input_path), "realtime": True}
             config["translator"]["context"] = args.context
             config["translator"]["n_predict"] = 64
             config["output"] = {"type": "mock"}

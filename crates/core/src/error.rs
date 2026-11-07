@@ -14,6 +14,8 @@ pub enum CoreError {
     Translator(String),
     #[error("output error: {0}")]
     Output(String),
+    #[error("storage error: {0}")]
+    Storage(String),
     #[error("session not found: {0}")]
     SessionNotFound(uuid::Uuid),
     #[error("I/O error: {0}")]
@@ -25,3 +27,9 @@ pub enum CoreError {
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
+
+impl From<rusqlite::Error> for CoreError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}

@@ -15,18 +15,36 @@ INPUT = ROOT / "runtime/hy-rotation-input.wav"
 CORE_LOG = ROOT / "runtime/hy-rotation-core.log"
 MODEL_LOG = ROOT / "runtime/model.log"
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+TOKEN = None
 
 
 def request(path, method="GET", body=None, timeout=30):
     data = None if body is None else json.dumps(body).encode()
+    headers = {"content-type": "application/json"}
+    if TOKEN:
+        headers["authorization"] = f"Bearer {TOKEN}"
     req = urllib.request.Request(
         BASE + path,
         data=data,
         method=method,
-        headers={"content-type": "application/json"},
+        headers=headers,
     )
     with OPENER.open(req, timeout=timeout) as response:
         return json.load(response)
+
+
+def import_media(path):
+    req = urllib.request.Request(
+        BASE + "/api/media?name=input.wav",
+        data=path.read_bytes(),
+        method="POST",
+        headers={
+            "content-type": "application/octet-stream",
+            "authorization": f"Bearer {TOKEN}",
+        },
+    )
+    with OPENER.open(req, timeout=120) as response:
+        return json.load(response)["path"]
 
 
 def wait_for(predicate, timeout, description):
@@ -43,6 +61,7 @@ def wait_for(predicate, timeout, description):
 
 
 def main():
+    global TOKEN
     pcm_path = WORKSPACE / "live-cache/recv.pcm"
     with pcm_path.open("rb") as source:
         pcm = source.read(16_000 * 2 * 75)
@@ -75,8 +94,9 @@ def main():
             15,
             "core health",
         )
+        TOKEN = json.loads((ROOT / "runtime/bootstrap.json").read_text())["token"]
         config = request("/api/default-config")
-        config["source"] = {"type": "file", "path": str(INPUT), "realtime": False}
+        config["source"] = {"type": "file", "path": import_media(INPUT), "realtime": False}
         config["translator"]["context"] = 1_024
         config["translator"]["n_predict"] = 64
         config["output"] = {"type": "mock"}

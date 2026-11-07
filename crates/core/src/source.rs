@@ -14,7 +14,7 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub enum SourceEvent {
     Frame(AudioFrame),
-    Dropped { duration_us: u32 },
+    Dropped { duration_us: u32, frames: u32 },
     Ended,
     Warning(String),
     Error(String),
@@ -206,6 +206,8 @@ async fn start_macos(
         let mut next_child = Some(child);
         let mut sequence = 0_u64;
         let mut discontinuity = true;
+        let mut dropped_duration_us = 0_u32;
+        let mut dropped_frames = 0_u32;
         let mut failures = 0_u32;
         loop {
             if task_stopped.load(std::sync::atomic::Ordering::Acquire) {
@@ -253,6 +255,17 @@ async fn start_macos(
                 let mut payload = vec![0_u8; 3_200];
                 match stdout.read_exact(&mut payload).await {
                     Ok(_) => {
+                        if dropped_duration_us > 0
+                            && sender
+                                .try_send(SourceEvent::Dropped {
+                                    duration_us: dropped_duration_us,
+                                    frames: dropped_frames,
+                                })
+                                .is_ok()
+                        {
+                            dropped_duration_us = 0;
+                            dropped_frames = 0;
+                        }
                         let mut frame = make_frame(session_id, epoch, sequence, "macos", payload);
                         frame.discontinuity = discontinuity;
                         discontinuity = false;
@@ -260,11 +273,9 @@ async fn start_macos(
                         match sender.try_send(SourceEvent::Frame(frame)) {
                             Ok(()) => {}
                             Err(mpsc::error::TrySendError::Full(_)) => {
-                                let _ = sender
-                                    .send(SourceEvent::Dropped {
-                                        duration_us: 100_000,
-                                    })
-                                    .await;
+                                dropped_duration_us = dropped_duration_us.saturating_add(100_000);
+                                dropped_frames = dropped_frames.saturating_add(1);
+                                discontinuity = true;
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => return,
                         }
@@ -347,6 +358,7 @@ async fn spawn_macos_host(config: &SourceConfig, options: &SourceStartOptions) -
         _ => unreachable!(),
     }
     command
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

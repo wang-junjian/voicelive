@@ -41,6 +41,8 @@ cargo test -p simulmt-core mock_session_covers_complete_lifecycle -- --nocapture
 ```bash
 # 先构建；脚本自行在随机端口启动 Core，使用临时 runtime 和 mock 链路
 python3 tests/pipeline/acceptance_echonote.py
+python3 tests/pipeline/security_boundary.py   # 本机认证、来源、路径和资源上限负向验收
+node tests/pipeline/ws_resync.mjs           # baseline、连续序号、重连、instance 和错误契约
 
 # 以下两个脚本连接已经运行的 Core（默认 8780）
 python3 tests/pipeline/http_mock.py
@@ -66,6 +68,7 @@ Rust 单元测试和 mock 管道不加载真实模型，也不创建系统音频
 - [crates/policy/src/lib.rs](crates/policy/src/lib.rs) 的 `AudioChunker` 将通常 100 ms 的传输帧拼成模型需要的 800 ms 块，并包含有界队列策略。
 - [crates/policy/src/subtitle.rs](crates/policy/src/subtitle.rs) 负责字幕组句；[crates/core/src/output.rs](crates/core/src/output.rs) 的 `SpeechAssembler` 独立负责 TTS 组句。两者阈值和策略不同，不要让字幕边界隐式决定播放边界。
 - [configs/](configs/) 下 YAML 是策略参考预设，当前代码不会加载它们。实际默认值来自 `/api/default-config` 和 API 类型默认值，运行中策略通过会话接口更新。
+- 公共 `PipelineConfig` 只包含音源、方向、语音和策略。模型 executable/model、player、runtime/cache 属于 `CoreOptions::deployment` 或由 runtime 派生，普通 REST 不能指定；旧存储中的这些字段在迁移读取时移除。文件音源只能引用 `/api/media` 生成的 UUID WAV。
 
 ### 2. 会话与数据面
 
@@ -81,8 +84,9 @@ SourceConfig → RunningSource → AudioFrame（100 ms）
 
 - 模型启动与采集启动分离：`prepare` 进入 `Ready`，`start` 才创建播放器和音源；`stop` 只停止采集/播放并保留模型，`stop_model` 才终止模型、递增 epoch 并回到 `Idle`。
 - 全局只有一个常驻模型。`SessionManager::prepare` 会将其他会话的 `Ready` 模型 detach/adopt 到新会话；`RunningTranslator::reattach` 重定向事件并清理音频和语言上下文，避免重复加载权重。新建会话也会停止其他会话的活动采集。
-- 字幕 JSONL 采用追加记录、读取时按 `cue_id` 折叠修订。内存历史最多 512 条，但磁盘历史完整保留；会话清单原子写入。重启只恢复配置、元数据和字幕，所有运行状态恢复为 `Idle`，不会恢复进程或 Tap。
-- 默认持久化位置为 `runtime/sessions/`、`runtime/subtitles/`，媒体、模型日志和 TTS 缓存也在 `runtime/` 下。
+- `runtime/echonote.db` 使用 SQLite WAL、单写入连接和 `synchronous=FULL`，保存会话、字幕修订、segment 关联、语音清单和迁移账本；WAV/媒体仍存文件系统。字幕与播放状态先提交数据库再广播。内存历史最多 512 条，数据库历史完整保留。重启只恢复配置、元数据和字幕，所有运行状态恢复为 `Idle`，不会恢复进程或 Tap。
+- 旧 `runtime/sessions/*.json`、`runtime/subtitles/*.jsonl` 和已有语音 WAV 在启动时只读迁移并保留原文件；迁移按 revision/timeline 重置拆分重复旧 cue，使用确定性 UUID 和逐行账本保证可重入。媒体、模型日志和 TTS 缓存也在 `runtime/` 下。
+- [crates/core/src/export.rs](crates/core/src/export.rs) 从同一 SQLite 只读事务快照固定字幕 revision 和语音清单；SRT 保留文本，VTT 转义 `&`/`<`/`>`。WAV 严格校验 ready 状态、PCM16 格式和完整数据，以 64 KiB 缓冲流式拼接，fsync 后通过唯一临时文件原子发布；缺段、截断、格式不一致或读取期间文件变化均报错。
 
 ### 3. 适配器与原生进程协议
 
@@ -95,15 +99,23 @@ SourceConfig → RunningSource → AudioFrame（100 ms）
 
 [apps/core/src/main.rs](apps/core/src/main.rs) 是 Axum 应用入口：集中定义 REST 路由、每会话 WebSocket 事件流、媒体导入、SRT/VTT/WAV 导出、静态前端和运行路径配置。新增会话能力通常需要同时检查共享 API 类型、Core 方法、HTTP 路由和前端事件处理。
 
+- [apps/core/src/auth.rs](apps/core/src/auth.rs) 实施数字 loopback 的 Host/Origin 精确 allowlist 和 Bearer 认证；只有健康检查与静态控制台无需 Bearer。WebSocket 不接受 query token，必须在 5 秒内经首条 JSON 消息认证，认证前不发送事件。
+- 每个会话事件携带 Core `instance_id`、单调 `sequence` 和 run `epoch`。`Session::subscribe_baseline` 在事件发布锁内固定 snapshot、完整 history 和游标，并创建恰好从下一序号开始的订阅；Lagged 时发送 `resync_required` 和新 baseline。前端 baseline 前缓冲事件，重复序号幂等忽略，空洞、未知消息或实例变化会关闭旧游标并重连。
+- [apps/core/src/contract.rs](apps/core/src/contract.rs) 为所有响应添加 `X-Request-Id`，并将框架及 Core 错误统一为 `ErrorInfo`；生命周期冲突使用 409，schema 拒绝使用 400/422，`retryable` 明确区分暂时性故障。[api/openapi.yaml](api/openapi.yaml) 由 Rust JsonSchema 类型生成，快照测试和 CI diff 防止漏更新；更新命令为 `cargo run -p simulmt-app --locked -- --print-openapi > api/openapi.yaml`。
+- [apps/core/src/bootstrap.rs](apps/core/src/bootstrap.rs) 每次启动生成 256-bit token 和 instance ID，将 URL/token 原子写入 `runtime/bootstrap.json`（`0600`）。`run.sh`/`scripts/dev.mjs` 输出带 `#auth=` 的 URL，前端保存到 sessionStorage 后立即清除 fragment；token 不得进入 query string 或 Core 日志。
+- [apps/core/src/media.rs](apps/core/src/media.rs) 流式上传并有界写入 UUID 临时文件，限制输入、并发、解码时间、输出和磁盘余量。`afconvert` 使用固定路径，成功校验 PCM16 WAV 后原子发布，失败清理输入和临时输出。
+- 桌面 WKWebView 的原生媒体桥只接受 main frame、匹配 loopback origin 和空消息 schema，原生上传自行添加 Bearer。
+
 [web/index.html](web/index.html) 保存多会话快照、按 `cue_id` 索引的时间线和当前 WebSocket；后端负责权威会话数据，浏览器 localStorage 只保存界面偏好和当前选择。[apps/desktop/src/main.swift](apps/desktop/src/main.swift) 只是加载本地 URL 的 WKWebView 壳，并提供原生媒体选择桥接。
 
 ## 路径与外部依赖
 
 - `SIMULMT_ROOT`：项目根目录，启动脚本会设置。
-- `SIMULMT_ADDR`：Core 监听地址，默认 `127.0.0.1:8780`。
+- `SIMULMT_ADDR`：Core 监听地址，默认 `127.0.0.1:8780`；只接受数字 loopback IP，其他地址 fail closed。
 - `SIMULMT_RUNTIME_DIR`：运行数据目录，默认 `runtime/`。
 - `SIMULMT_AUDIO_HOST`：覆盖原生音频宿主路径。
 - `SIMULMT_DEMO_ROOT`：覆盖模型依赖根目录；默认使用存在 `models/` 的项目内 `vendor/`，否则回退到项目上一级目录。
 - `SIMULMT_UI_URL`：桌面壳加载的 URL；`RUST_LOG` 可调整 Rust 日志。
+- 媒体资源由 `SIMULMT_MEDIA_MAX_BYTES`、`SIMULMT_MEDIA_MAX_OUTPUT_BYTES`、`SIMULMT_MEDIA_DECODE_TIMEOUT_SECS`、`SIMULMT_MEDIA_DISK_RESERVE_BYTES`、`SIMULMT_MEDIA_CONCURRENCY` 在启动期设置；这些不是会话配置。
 
 真实模型默认需要 `vendor/llama.cpp-hyv3/build/bin/llama-mtmd-cli` 和支持 Hy-SimulMT 的 llama.cpp 构建，以及约 18.4 GiB 的 `vendor/models/Hy-SimulMT-30B-A3B-Interleave-Q4_K_M.gguf`。`vendor/`、`runtime/` 和 `target/` 均为本地生成或下载内容。

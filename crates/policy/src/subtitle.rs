@@ -4,7 +4,6 @@ use simulmt_api::{SubtitleCue, TranslationEvent};
 #[derive(Default)]
 pub struct SubtitleAssembler {
     current: Option<SubtitleCue>,
-    next_id: u64,
 }
 
 impl SubtitleAssembler {
@@ -13,10 +12,8 @@ impl SubtitleAssembler {
             self.current = None;
         }
         if self.current.is_none() {
-            let cue_id = self.next_id;
-            self.next_id += 1;
             self.current = Some(SubtitleCue {
-                cue_id: format!("cue-{cue_id}"),
+                cue_id: uuid::Uuid::new_v4().to_string(),
                 revision: 0,
                 source_text: String::new(),
                 translated_text: String::new(),
@@ -92,6 +89,7 @@ mod tests {
         TranslationEvent {
             session_id: Uuid::nil(),
             epoch: 1,
+            source_generation: 0,
             segment_id: format!("segment-{index}"),
             revision: 0,
             event_type: TranslationEventType::Append,

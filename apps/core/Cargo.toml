@@ -7,9 +7,13 @@ license.workspace = true
 [dependencies]
 axum.workspace = true
 futures-util.workspace = true
+getrandom.workspace = true
 hound.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+schemars.workspace = true
+serde_yaml.workspace = true
 simulmt-api = { path = "../../crates/api" }
 simulmt-core = { path = "../../crates/core" }
 tokio.workspace = true
@@ -17,3 +21,6 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

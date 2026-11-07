@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -23,3 +24,22 @@ const stop = () => child.kill("SIGTERM");
 process.on("SIGINT", stop);
 process.on("SIGTERM", stop);
 child.on("exit", (code, signal) => process.exit(code ?? (signal ? 1 : 0)));
+
+const runtime = process.env.SIMULMT_RUNTIME_DIR || path.join(root, "runtime");
+let announced = false;
+for (let attempt = 0; attempt < 80; attempt++) {
+  try {
+    const response = await fetch(`http://${host}:${port}/api/health`);
+    if (response.ok) {
+      const bootstrap = JSON.parse(fs.readFileSync(path.join(runtime, "bootstrap.json"), "utf8"));
+      console.log(`EchoNote console: ${bootstrap.url}/#auth=${bootstrap.token}`);
+      announced = true;
+      break;
+    }
+  } catch {}
+  await new Promise(resolve => setTimeout(resolve, 250));
+}
+if (!announced && child.exitCode === null) {
+  console.error("EchoNote Core did not become ready");
+  child.kill("SIGTERM");
+}

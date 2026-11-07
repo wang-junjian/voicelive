@@ -1,16 +1,28 @@
-use axum::body::{Body, Bytes};
+mod auth;
+mod bootstrap;
+mod contract;
+mod media;
+mod openapi;
+
+use auth::{LocalAuth, authorize, security_error};
+use axum::body::Body;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
-use axum::{Json, Router};
+use axum::{Json, Router, middleware};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use simulmt_api::*;
-use simulmt_core::{CoreError, CoreOptions, SessionManager, list_macos_sources};
-use std::path::PathBuf;
+use simulmt_core::{
+    CoreError, CoreOptions, DeploymentConfig, SessionManager, SubtitleExportFormat,
+    list_macos_sources,
+};
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -18,30 +30,39 @@ use uuid::Uuid;
 struct AppState {
     manager: Arc<SessionManager>,
     audio_host: String,
-    paths: ProjectPaths,
+    runtime_dir: PathBuf,
+    media_limits: media::MediaLimits,
+    media_gate: Arc<Semaphore>,
+    auth: LocalAuth,
 }
 
-#[derive(Clone)]
-struct ProjectPaths {
-    root: PathBuf,
-    demo: PathBuf,
-    runtime: PathBuf,
-}
-
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct Health {
     api_version: &'static str,
+    instance_id: Uuid,
     status: &'static str,
 }
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().any(|argument| argument == "--print-openapi") {
+        print!("{}", openapi::document_yaml());
+        return;
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "simulmt_app=info,simulmt_core=info".into()),
         )
         .init();
+    let address = std::env::var("SIMULMT_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8780".into())
+        .parse::<std::net::SocketAddr>()
+        .expect("SIMULMT_ADDR must be a numeric loopback IP and port");
+    if !address.ip().is_loopback() {
+        panic!("SIMULMT_ADDR must be loopback; remote control-plane access is disabled");
+    }
+    let media_limits = media::MediaLimits::from_env().expect("valid media resource limits");
     let root = std::env::var("SIMULMT_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().expect("current directory"));
@@ -67,27 +88,40 @@ async fn main() {
     tokio::fs::create_dir_all(&runtime)
         .await
         .expect("create runtime directory");
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .expect("bind local API");
+    let identity = bootstrap::publish(&runtime, address).expect("publish owner-only bootstrap");
     let manager = Arc::new(
         SessionManager::load(CoreOptions {
             audio_host: audio_host.clone(),
             runtime_dir: runtime.to_string_lossy().into_owned(),
+            instance_id: identity.instance_id,
+            deployment: DeploymentConfig {
+                model_executable: demo.join("llama.cpp-hyv3/build/bin/llama-mtmd-cli"),
+                model_path: demo.join("models/Hy-SimulMT-30B-A3B-Interleave-Q4_K_M.gguf"),
+                player_path: root.join("target/native/simulmt-tts-host"),
+            },
         })
         .await
         .expect("restore local sessions"),
     );
+    let auth = LocalAuth::new(address, identity.token.clone());
     let state = AppState {
         manager: Arc::clone(&manager),
         audio_host,
-        paths: ProjectPaths {
-            root: root.clone(),
-            demo,
-            runtime,
-        },
+        runtime_dir: runtime,
+        media_gate: Arc::new(Semaphore::new(media_limits.concurrency)),
+        media_limits,
+        auth: auth.clone(),
     };
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/sources", get(sources))
-        .route("/api/media", post(import_media))
+        .route(
+            "/api/media",
+            post(import_media).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/default-config", get(default_config))
         .route("/api/sessions", post(create_session).get(list_sessions))
         .route(
@@ -115,24 +149,36 @@ async fn main() {
         .route("/api/sessions/{id}/ws", get(websocket))
         .fallback_service(ServeDir::new(&web).fallback(ServeFile::new(web.join("index.html"))))
         .with_state(state)
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024));
-    let address = std::env::var("SIMULMT_ADDR").unwrap_or_else(|_| "127.0.0.1:8780".into());
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .expect("bind local API");
-    tracing::info!("SimulMT listening on http://{address}");
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(middleware::from_fn_with_state(auth, authorize))
+        .layer(middleware::from_fn(contract::request_context));
+    tracing::info!("EchoNote listening on http://{address}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            #[cfg(unix)]
+            {
+                let mut terminate =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("install SIGTERM handler");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
             manager.stop_all().await;
         })
         .await
         .expect("serve local API");
 }
 
-async fn health() -> Json<Health> {
+async fn health(State(state): State<AppState>) -> Json<Health> {
     Json(Health {
         api_version: API_VERSION,
+        instance_id: state.manager.instance_id(),
         status: "ok",
     })
 }
@@ -141,108 +187,49 @@ async fn sources(State(state): State<AppState>) -> Result<Json<Vec<SourceInfo>>,
     Ok(Json(list_macos_sources(&state.audio_host).await?))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct MediaUploadQuery {
     name: Option<String>,
-}
-
-#[derive(Serialize)]
-struct ImportedMedia {
-    name: String,
-    path: String,
 }
 
 async fn import_media(
     State(state): State<AppState>,
     Query(query): Query<MediaUploadQuery>,
-    body: Bytes,
-) -> Result<Json<ImportedMedia>, ApiError> {
-    if body.is_empty() {
-        return Err(CoreError::InvalidConfig("the selected media file is empty".into()).into());
-    }
-    let name = query.name.unwrap_or_else(|| "local-media.wav".into());
-    let extension = std::path::Path::new(&name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("wav")
-        .to_ascii_lowercase();
-    let supported = ["wav", "mp3", "m4a", "aac", "flac", "mp4", "mov", "m4v"];
-    if !supported.contains(&extension.as_str()) {
-        return Err(CoreError::InvalidConfig(format!(
-            "unsupported media format .{extension}; use WAV, MP3, M4A, AAC, FLAC, MP4, MOV or M4V"
-        ))
-        .into());
-    }
-    let directory = state.paths.runtime.join("media");
-    tokio::fs::create_dir_all(&directory)
-        .await
-        .map_err(CoreError::from)?;
-    let stem = Uuid::new_v4().to_string();
-    let input = directory.join(format!("{stem}-input.{extension}"));
-    let output = directory.join(format!("{stem}.wav"));
-    tokio::fs::write(&input, body)
-        .await
-        .map_err(CoreError::from)?;
-    let converted = tokio::process::Command::new("/usr/bin/afconvert")
-        .arg("-f")
-        .arg("WAVE")
-        .arg("-d")
-        .arg("LEI16@16000")
-        .arg("-c")
-        .arg("1")
-        .arg(&input)
-        .arg(&output)
-        .output()
-        .await
-        .map_err(|error| CoreError::Source(format!("failed to start media decoder: {error}")))?;
-    if !converted.status.success() {
-        let _ = tokio::fs::remove_file(&input).await;
-        let _ = tokio::fs::remove_file(&output).await;
-        return Err(CoreError::InvalidConfig(format!(
-            "cannot decode this media file: {}",
-            String::from_utf8_lossy(&converted.stderr).trim()
-        ))
-        .into());
-    }
-    Ok(Json(ImportedMedia {
-        name,
-        path: output.to_string_lossy().into_owned(),
-    }))
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Json<media::ImportedMedia>, Response> {
+    let _permit = Arc::clone(&state.media_gate)
+        .try_acquire_owned()
+        .map_err(|_| {
+            security_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "media_decoder_busy",
+                "the media decoder concurrency limit has been reached; retry later",
+            )
+        })?;
+    media::import(
+        &state.runtime_dir,
+        query.name,
+        headers,
+        body,
+        state.media_limits,
+    )
+    .await
+    .map(Json)
 }
 
-async fn default_config(State(state): State<AppState>) -> Json<PipelineConfig> {
-    let demo = &state.paths.demo;
+async fn default_config() -> Json<PipelineConfig> {
     Json(PipelineConfig {
         source: SourceConfig::MacosSystem {
             exclude_pids: vec![],
             mute_original: true,
         },
         translator: TranslatorConfig::HySimulmt {
-            executable: demo
-                .join("llama.cpp-hyv3/build/bin/llama-mtmd-cli")
-                .to_string_lossy()
-                .into_owned(),
-            model: demo
-                .join("models/Hy-SimulMT-30B-A3B-Interleave-Q4_K_M.gguf")
-                .to_string_lossy()
-                .into_owned(),
             direction: "en-zh".into(),
             context: Some(16_384),
             n_predict: Some(160),
         },
         output: OutputConfig::MacosSystem {
-            player_path: state
-                .paths
-                .root
-                .join("target/native/simulmt-tts-host")
-                .to_string_lossy()
-                .into_owned(),
-            cache_dir: state
-                .paths
-                .runtime
-                .join("cache")
-                .to_string_lossy()
-                .into_owned(),
             voice: Some("Tingting".into()),
             // Synthesize near natural speed; playback fits each phrase to its
             // source duration and only adds catch-up when real backlog exists.
@@ -254,11 +241,40 @@ async fn default_config(State(state): State<AppState>) -> Json<PipelineConfig> {
     })
 }
 
+fn validate_public_config(config: &PipelineConfig, runtime_dir: &FsPath) -> Result<(), ApiError> {
+    validate_public_source(&config.source, runtime_dir)
+}
+
+fn validate_public_source(source: &SourceConfig, runtime_dir: &FsPath) -> Result<(), ApiError> {
+    let SourceConfig::File { path, .. } = source else {
+        return Ok(());
+    };
+    let media_root = std::fs::canonicalize(runtime_dir.join("media")).map_err(|_| {
+        CoreError::InvalidConfig("import media before selecting a file source".into())
+    })?;
+    let candidate = std::fs::canonicalize(path).map_err(|_| {
+        CoreError::InvalidConfig("the selected media is no longer available".into())
+    })?;
+    let valid_name = candidate
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| Uuid::parse_str(value).is_ok())
+        && candidate.extension().and_then(|value| value.to_str()) == Some("wav");
+    if candidate.parent() != Some(media_root.as_path()) || !valid_name || !candidate.is_file() {
+        return Err(CoreError::InvalidConfig(
+            "file sources must reference a WAV imported through /api/media".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 async fn create_session(
     State(state): State<AppState>,
     Json(config): Json<PipelineConfig>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
-    let session = state.manager.create(config).await;
+    validate_public_config(&config, &state.runtime_dir)?;
+    let session = state.manager.create(config).await?;
     Ok(Json(session.snapshot().await))
 }
 
@@ -286,7 +302,7 @@ async fn delete_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct SessionTitle {
     title: String,
 }
@@ -307,6 +323,7 @@ async fn reconfigure(
     Json(config): Json<PipelineConfig>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
     let session = state.manager.get(id).await?;
+    validate_public_config(&config, &state.runtime_dir)?;
     session.reconfigure(config).await?;
     Ok(Json(session.snapshot().await))
 }
@@ -355,7 +372,7 @@ async fn stop(
     Ok(Json(session.snapshot().await))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct SourceSelection {
     source: SourceConfig,
     mute_original: bool,
@@ -376,13 +393,14 @@ async fn set_source(
     Json(selection): Json<SourceSelection>,
 ) -> Result<Json<SessionSnapshot>, ApiError> {
     let session = state.manager.get(id).await?;
+    validate_public_source(&selection.source, &state.runtime_dir)?;
     session
         .set_source(selection.source, selection.mute_original)
         .await?;
     Ok(Json(session.snapshot().await))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct DirectionSelection {
     direction: String,
 }
@@ -397,7 +415,7 @@ async fn set_direction(
     Ok(Json(session.snapshot().await))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, JsonSchema)]
 struct LatencySelection {
     latency_mode: LatencyMode,
 }
@@ -416,7 +434,7 @@ async fn history(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<SubtitleCue>>, ApiError> {
-    Ok(Json(state.manager.get(id).await?.history().await))
+    Ok(Json(state.manager.get(id).await?.history().await?))
 }
 
 async fn clear_history(
@@ -424,7 +442,7 @@ async fn clear_history(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<SubtitleCue>>, ApiError> {
     let session = state.manager.get(id).await?;
-    session.clear_history().await;
+    session.clear_history().await?;
     Ok(Json(Vec::new()))
 }
 
@@ -432,11 +450,16 @@ async fn export_srt(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let cues = state.manager.get(id).await?.history().await;
+    let document = state
+        .manager
+        .get(id)
+        .await?
+        .export_subtitles(SubtitleExportFormat::Srt)
+        .await?;
     Ok(download_response(
         "simulmt-subtitles.srt",
         "application/x-subrip; charset=utf-8",
-        subtitle_document(&cues, false).into_bytes(),
+        document.into_bytes(),
     ))
 }
 
@@ -444,11 +467,16 @@ async fn export_vtt(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let cues = state.manager.get(id).await?.history().await;
+    let document = state
+        .manager
+        .get(id)
+        .await?
+        .export_subtitles(SubtitleExportFormat::Vtt)
+        .await?;
     Ok(download_response(
         "simulmt-subtitles.vtt",
         "text/vtt; charset=utf-8",
-        subtitle_document(&cues, true).into_bytes(),
+        document.into_bytes(),
     ))
 }
 
@@ -456,51 +484,7 @@ async fn export_wav(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
-    let snapshot = state.manager.get(id).await?.snapshot().await;
-    let cache_dir = match snapshot.config.output {
-        OutputConfig::MacosSystem { cache_dir, .. } => PathBuf::from(cache_dir),
-        OutputConfig::Mock => {
-            return Err(
-                CoreError::InvalidConfig("mock output does not create audio files".into()).into(),
-            );
-        }
-    };
-    let mut paths = Vec::new();
-    for token in 1_u64.. {
-        let path = cache_dir.join(format!("speech-{id}-{token}.wav"));
-        if !path.exists() {
-            break;
-        }
-        paths.push(path);
-    }
-    if paths.is_empty() {
-        return Err(CoreError::InvalidConfig(
-            "no synthesized translation audio is available yet".into(),
-        )
-        .into());
-    }
-    let first =
-        hound::WavReader::open(&paths[0]).map_err(|error| CoreError::Output(error.to_string()))?;
-    let spec = first.spec();
-    drop(first);
-    let export_path = cache_dir.join(format!("simulmt-translation-{id}.wav"));
-    let mut writer = hound::WavWriter::create(&export_path, spec)
-        .map_err(|error| CoreError::Output(error.to_string()))?;
-    for path in paths {
-        let mut reader =
-            hound::WavReader::open(path).map_err(|error| CoreError::Output(error.to_string()))?;
-        if reader.spec() != spec {
-            return Err(CoreError::Output("inconsistent synthesized WAV formats".into()).into());
-        }
-        for sample in reader.samples::<i16>() {
-            writer
-                .write_sample(sample.map_err(|error| CoreError::Output(error.to_string()))?)
-                .map_err(|error| CoreError::Output(error.to_string()))?;
-        }
-    }
-    writer
-        .finalize()
-        .map_err(|error| CoreError::Output(error.to_string()))?;
+    let export_path = state.manager.get(id).await?.export_wav().await?;
     let file = tokio::fs::File::open(export_path)
         .await
         .map_err(|error| CoreError::Output(error.to_string()))?;
@@ -546,68 +530,124 @@ fn download_headers(filename: &'static str, content_type: &'static str) -> Heade
     headers
 }
 
-fn subtitle_document(cues: &[SubtitleCue], vtt: bool) -> String {
-    let mut output = if vtt {
-        "WEBVTT\n\n".to_string()
-    } else {
-        String::new()
-    };
-    for (index, cue) in cues.iter().enumerate() {
-        if !vtt {
-            output.push_str(&(index + 1).to_string());
-            output.push('\n');
-        }
-        output.push_str(&format!(
-            "{} --> {}\n{}\n{}\n\n",
-            subtitle_time(cue.source_start_ns, vtt),
-            subtitle_time(
-                cue.source_end_ns.max(cue.source_start_ns + 400_000_000),
-                vtt
-            ),
-            cue.source_text,
-            cue.translated_text
-        ));
-    }
-    output
-}
-
-fn subtitle_time(ns: i64, vtt: bool) -> String {
-    let total_ms = (ns.max(0) / 1_000_000) as u64;
-    let hours = total_ms / 3_600_000;
-    let minutes = total_ms / 60_000 % 60;
-    let seconds = total_ms / 1_000 % 60;
-    let millis = total_ms % 1_000;
-    let separator = if vtt { '.' } else { ',' };
-    format!("{hours:02}:{minutes:02}:{seconds:02}{separator}{millis:03}")
-}
-
 async fn websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     let session = state.manager.get(id).await?;
-    Ok(ws.on_upgrade(move |socket| stream_events(socket, session.subscribe())))
+    let auth = state.auth.clone();
+    Ok(ws
+        .max_message_size(4 * 1024)
+        .max_frame_size(4 * 1024)
+        .on_upgrade(move |socket| stream_events(socket, session, auth)))
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SocketAuthentication {
+    #[serde(rename = "type")]
+    kind: String,
+    token: String,
 }
 
 async fn stream_events(
     mut socket: WebSocket,
-    mut events: tokio::sync::broadcast::Receiver<SessionEvent>,
+    session: Arc<simulmt_core::Session>,
+    auth: LocalAuth,
 ) {
+    let authenticated = tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv())
+        .await
+        .ok()
+        .flatten()
+        .and_then(Result::ok)
+        .and_then(|message| match message {
+            Message::Text(text) => serde_json::from_str::<SocketAuthentication>(&text).ok(),
+            _ => None,
+        })
+        .is_some_and(|authentication| {
+            authentication.kind == "authenticate" && auth.accepts_token(&authentication.token)
+        });
+    if !authenticated {
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: 1008,
+                reason: "valid first-message authentication required".into(),
+            })))
+            .await;
+        return;
+    }
+    let (baseline, mut events) = match session.subscribe_baseline().await {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            tracing::warn!(session_id = %session.id, "failed to create WS baseline: {error}");
+            let _ = socket
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: "baseline unavailable".into(),
+                })))
+                .await;
+            return;
+        }
+    };
+    if send_stream_message(
+        &mut socket,
+        SessionStreamMessage::Baseline(Box::new(baseline)),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
     loop {
         match events.recv().await {
             Ok(event) => {
-                let text = serde_json::to_string(&event).expect("serialize event");
-                if socket.send(Message::Text(text.into())).await.is_err() {
+                if send_stream_message(&mut socket, SessionStreamMessage::Event(event))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!("UI event receiver lagged by {skipped} events");
+                tracing::warn!(session_id = %session.id, "UI event receiver lagged by {skipped} events");
+                match session.subscribe_baseline().await {
+                    Ok((baseline, replacement)) => {
+                        let notice = SessionStreamMessage::ResyncRequired {
+                            instance_id: baseline.instance_id,
+                            session_id: baseline.session_id,
+                            sequence: baseline.sequence,
+                            reason: format!("event buffer overflowed; skipped {skipped} events"),
+                        };
+                        if send_stream_message(&mut socket, notice).await.is_err()
+                            || send_stream_message(
+                                &mut socket,
+                                SessionStreamMessage::Baseline(Box::new(baseline)),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        events = replacement;
+                    }
+                    Err(error) => {
+                        tracing::warn!(session_id = %session.id, "failed to resync WS baseline: {error}");
+                        break;
+                    }
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+async fn send_stream_message(
+    socket: &mut WebSocket,
+    message: SessionStreamMessage,
+) -> Result<(), axum::Error> {
+    let text = serde_json::to_string(&message).expect("serialize event");
+    socket.send(Message::Text(text.into())).await
 }
 
 struct ApiError(CoreError);
@@ -620,18 +660,60 @@ impl From<CoreError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let status = match self.0 {
-            CoreError::SessionNotFound(_) => StatusCode::NOT_FOUND,
-            CoreError::InvalidState(_) | CoreError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
-            CoreError::PermissionDenied(_) => StatusCode::FORBIDDEN,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        let (status, code, component_id, retryable) = match &self.0 {
+            CoreError::SessionNotFound(_) => {
+                (StatusCode::NOT_FOUND, "session_not_found", "session", false)
+            }
+            CoreError::InvalidState(_) => (StatusCode::CONFLICT, "invalid_state", "session", false),
+            CoreError::InvalidConfig(_) => {
+                (StatusCode::BAD_REQUEST, "invalid_config", "session", false)
+            }
+            CoreError::PermissionDenied(_) => {
+                (StatusCode::FORBIDDEN, "permission_denied", "source", false)
+            }
+            CoreError::RoutingUnsafe(_) => {
+                (StatusCode::CONFLICT, "routing_unsafe", "source", false)
+            }
+            CoreError::Source(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "source_unavailable",
+                "source",
+                true,
+            ),
+            CoreError::Translator(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "translator_unavailable",
+                "translator",
+                true,
+            ),
+            CoreError::Output(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "output_unavailable",
+                "output",
+                true,
+            ),
+            CoreError::Storage(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                "storage",
+                false,
+            ),
+            CoreError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, "io_error", "core", false),
+            CoreError::Protocol(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "protocol_error",
+                "core",
+                false,
+            ),
+            CoreError::Policy(_) => (StatusCode::BAD_REQUEST, "invalid_policy", "policy", false),
         };
         let error = ErrorInfo {
-            code: "core_error".into(),
-            component_id: "core".into(),
+            code: code.into(),
+            component_id: component_id.into(),
             message: self.0.to_string(),
-            retryable: false,
+            retryable,
             fatal: false,
+            request_id: String::new(),
         };
         (status, Json(error)).into_response()
     }

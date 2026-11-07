@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 import json
 import os
+from pathlib import Path
 import time
 import urllib.request
 
 BASE = os.environ.get("SIMULMT_TEST_URL", "http://127.0.0.1:8780")
+ROOT = Path(__file__).resolve().parents[2]
+TOKEN = os.environ.get("SIMULMT_TEST_TOKEN") or json.loads((ROOT / "runtime/bootstrap.json").read_text())["token"]
 
 def request(path, method="GET", body=None):
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(BASE + path, data=data, method=method, headers={"content-type": "application/json"})
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}"})
     with urllib.request.urlopen(req, timeout=20) as response:
         return json.load(response)
 
@@ -42,7 +45,11 @@ history = request(f"/api/sessions/{sid}/history")
 assert len(history) >= 1, history
 assert history[-1]["is_final"], history[-1]
 for extension, marker in [("srt", b" --> "), ("vtt", b"WEBVTT")]:
-    with urllib.request.urlopen(f"{BASE}/api/sessions/{sid}/export.{extension}", timeout=20) as response:
+    export_request = urllib.request.Request(
+        f"{BASE}/api/sessions/{sid}/export.{extension}",
+        headers={"authorization": f"Bearer {TOKEN}"},
+    )
+    with urllib.request.urlopen(export_request, timeout=20) as response:
         exported = response.read()
         assert marker in exported, exported
 request(f"/api/sessions/{sid}/history", "DELETE")

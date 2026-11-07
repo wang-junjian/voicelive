@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 import json
 import os
+from pathlib import Path
 import time
 import urllib.request
 
 BASE = os.environ.get("SIMULMT_TEST_URL", "http://127.0.0.1:8780")
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+TOKEN = os.environ.get("SIMULMT_TEST_TOKEN") or json.loads(Path(ROOT, "runtime/bootstrap.json").read_text())["token"]
 
 def request(path, method="GET", body=None):
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(BASE + path, data=data, method=method, headers={"content-type": "application/json"})
+    req = urllib.request.Request(BASE + path, data=data, method=method, headers={"content-type": "application/json", "authorization": f"Bearer {TOKEN}"})
     with OPENER.open(req, timeout=20) as response:
         return json.load(response)
 
@@ -18,6 +21,7 @@ config["source"] = {"type": "mock", "frames": 8}
 config["translator"] = {"type": "mock"}
 session = request("/api/sessions", "POST", config)
 sid = session["session_id"]
+snapshot = session
 try:
     request(f"/api/sessions/{sid}/prepare", "POST", {})
     for _ in range(100):
@@ -29,7 +33,11 @@ try:
     while time.time() < deadline:
         snapshot = request(f"/api/sessions/{sid}")
         if snapshot["metrics"]["playback_finished"] >= 1:
-            with OPENER.open(f"{BASE}/api/sessions/{sid}/export.wav", timeout=20) as response:
+            export_request = urllib.request.Request(
+                f"{BASE}/api/sessions/{sid}/export.wav",
+                headers={"authorization": f"Bearer {TOKEN}"},
+            )
+            with OPENER.open(export_request, timeout=20) as response:
                 audio = response.read()
                 assert audio.startswith(b"RIFF") and len(audio) > 1000, len(audio)
             print(json.dumps({"ok": True, "playback_started": snapshot["metrics"]["playback_started"], "playback_finished": snapshot["metrics"]["playback_finished"], "wav_bytes": len(audio)}))

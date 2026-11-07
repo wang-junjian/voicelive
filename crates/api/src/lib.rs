@@ -1,3 +1,4 @@
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -5,7 +6,7 @@ pub const API_VERSION: &str = "simulmt.api.v1";
 pub const NORMALIZED_SAMPLE_RATE: u32 = 16_000;
 pub const MODEL_BLOCK_US: u32 = 800_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     Idle,
@@ -18,7 +19,7 @@ pub enum SessionState {
     Faulted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
     Unknown,
@@ -28,14 +29,14 @@ pub enum HealthState {
     Failed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SampleEncoding {
     PcmS16le,
     PcmF32le,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct AudioFormat {
     pub sample_rate: u32,
     pub channels: u16,
@@ -54,7 +55,7 @@ impl Default for AudioFormat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AudioFrame {
     pub session_id: Uuid,
     pub epoch: u64,
@@ -69,7 +70,7 @@ pub struct AudioFrame {
     pub discontinuity: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SourceInfo {
     pub source_id: String,
     pub kind: String,
@@ -81,8 +82,8 @@ pub struct SourceInfo {
     pub is_running: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceConfig {
     Mock {
         frames: Option<u32>,
@@ -108,32 +109,24 @@ impl Default for SourceConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TranslatorConfig {
+    #[default]
     Mock,
     HySimulmt {
-        executable: String,
-        model: String,
         direction: String,
         context: Option<u32>,
         n_predict: Option<u32>,
     },
 }
 
-impl Default for TranslatorConfig {
-    fn default() -> Self {
-        Self::Mock
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OutputConfig {
+    #[default]
     Mock,
     MacosSystem {
-        player_path: String,
-        cache_dir: String,
         voice: Option<String>,
         /// Approximate words per minute for the resident system synthesizer.
         /// Higher values shorten each segment and reduce playback backlog.
@@ -141,13 +134,7 @@ pub enum OutputConfig {
     },
 }
 
-impl Default for OutputConfig {
-    fn default() -> Self {
-        Self::Mock
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LatencyMode {
     LowLatency,
@@ -155,7 +142,7 @@ pub enum LatencyMode {
     Complete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OverflowBehavior {
     BlockProducer,
@@ -165,7 +152,7 @@ pub enum OverflowBehavior {
     FailSession,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QueuePolicy {
     pub max_frames: usize,
     pub max_buffered_duration_us: u32,
@@ -184,7 +171,8 @@ impl Default for QueuePolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
     pub source: SourceConfig,
     pub translator: TranslatorConfig,
@@ -207,7 +195,7 @@ impl Default for PipelineConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TranslationEventType {
     Append,
@@ -216,10 +204,12 @@ pub enum TranslationEventType {
     Reset,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranslationEvent {
     pub session_id: Uuid,
     pub epoch: u64,
+    #[serde(default)]
+    pub source_generation: u64,
     pub segment_id: String,
     pub revision: u64,
     pub event_type: TranslationEventType,
@@ -233,7 +223,7 @@ pub struct TranslationEvent {
     pub speakable: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SubtitleCue {
     pub cue_id: String,
     pub revision: u64,
@@ -246,7 +236,7 @@ pub struct SubtitleCue {
     pub segment_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PlaybackEventType {
     Queued,
@@ -257,7 +247,7 @@ pub enum PlaybackEventType {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PlaybackEvent {
     pub event_type: PlaybackEventType,
     pub segment_id: String,
@@ -268,7 +258,7 @@ pub struct PlaybackEvent {
     pub source_end_ns: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct SessionMetrics {
     pub captured_frames: u64,
     pub captured_duration_us: u64,
@@ -284,6 +274,8 @@ pub struct SessionMetrics {
     pub playback_started: u64,
     pub playback_finished: u64,
     pub playback_cancelled: u64,
+    #[serde(default)]
+    pub playback_pending: u64,
     pub output_latency_us: u64,
     pub max_output_latency_us: u64,
     pub playback_lag_us: u64,
@@ -293,7 +285,7 @@ pub struct SessionMetrics {
     pub source_resets: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum SessionEventKind {
     State {
@@ -316,19 +308,49 @@ pub enum SessionEventKind {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionEvent {
     pub api_version: String,
+    /// Identifies one Core process lifetime. A change invalidates every cursor.
+    pub instance_id: Uuid,
     pub session_id: Uuid,
+    /// Monotonically increasing within instance_id + session_id, starting at 1.
+    pub sequence: u64,
     pub epoch: u64,
     pub emitted_mono_ns: i64,
     pub kind: SessionEventKind,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Authoritative state at `sequence`; live events begin at `sequence + 1`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SessionBaseline {
+    pub api_version: String,
+    pub instance_id: Uuid,
+    pub session_id: Uuid,
+    pub sequence: u64,
+    pub snapshot: SessionSnapshot,
+    pub history: Vec<SubtitleCue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum SessionStreamMessage {
+    Baseline(Box<SessionBaseline>),
+    Event(SessionEvent),
+    ResyncRequired {
+        instance_id: Uuid,
+        session_id: Uuid,
+        sequence: u64,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSnapshot {
     pub api_version: String,
+    pub instance_id: Uuid,
     pub session_id: Uuid,
+    pub event_sequence: u64,
     pub epoch: u64,
     pub state: SessionState,
     pub title: String,
@@ -340,11 +362,13 @@ pub struct SessionSnapshot {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ErrorInfo {
     pub code: String,
     pub component_id: String,
     pub message: String,
     pub retryable: bool,
     pub fatal: bool,
+    /// Populated by the outer HTTP middleware; matches X-Request-Id.
+    pub request_id: String,
 }
