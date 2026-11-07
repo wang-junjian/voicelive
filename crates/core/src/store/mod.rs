@@ -2,7 +2,7 @@ use crate::error::{CoreError, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use simulmt_api::{OutputConfig, PipelineConfig, PlaybackEvent, PlaybackEventType, SubtitleCue};
+use simulmt_api::{OutputConfig, PipelineConfig, SubtitleCue};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -249,91 +249,53 @@ impl Store {
         .await
     }
 
-    pub async fn record_playback(
-        &self,
-        session_id: Uuid,
-        cache_dir: PathBuf,
-        event: PlaybackEvent,
-    ) -> Result<bool> {
+    pub async fn playback_status(&self, session_id: Uuid, token: u64) -> Result<Option<String>> {
         self.run(move |connection| {
-            let status = speech_status(event.event_type);
-            let current = connection
+            connection
                 .query_row(
                     "SELECT status FROM speech_segments WHERE session_id = ?1 AND token = ?2",
-                    params![session_id.to_string(), event.token as i64],
+                    params![session_id.to_string(), token as i64],
                     |row| row.get::<_, String>(0),
                 )
-                .optional()?;
-            if current.as_deref().is_some_and(|current| {
-                is_terminal_speech(current)
-                    || current == status
-                    || (current == "playing" && status == "pending")
-            }) {
-                return Ok(false);
-            }
-            let path = cache_dir.join(format!("speech-{session_id}-{}.wav", event.token));
-            connection.execute(
-                "INSERT INTO speech_segments(
-                     session_id, token, segment_id, path, status, source_end_ns
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(session_id, token) DO UPDATE SET
-                     segment_id = excluded.segment_id,
-                     status = excluded.status,
-                     source_end_ns = excluded.source_end_ns",
-                params![
-                    session_id.to_string(),
-                    event.token as i64,
-                    event.segment_id,
-                    path.to_string_lossy(),
-                    status,
-                    event.source_end_ns,
-                ],
-            )?;
-            Ok(true)
+                .optional()
+                .map_err(Into::into)
         })
         .await
     }
 
-    pub async fn next_speech_token(&self, session_id: Uuid) -> Result<u64> {
+    pub async fn persist_playback(&self, session_id: Uuid, segment: SpeechSegment) -> Result<()> {
+        self.run(move |connection| upsert_speech_segment(connection, session_id, segment))
+            .await
+    }
+
+    pub async fn highest_speech_token(&self, session_id: Uuid) -> Result<u64> {
         self.run(move |connection| {
             let maximum = connection.query_row(
                 "SELECT COALESCE(MAX(token), 0) FROM speech_segments WHERE session_id = ?1",
                 params![session_id.to_string()],
                 |row| row.get::<_, i64>(0),
             )?;
-            Ok((maximum.max(0) as u64).saturating_add(1))
+            Ok(maximum.max(0) as u64)
         })
         .await
     }
 
-    /// Reconciles files left by a stopped/crashed player, then closes any
-    /// remaining non-terminal states. No player may be running for this session.
-    pub async fn recover_speech(&self, session_id: Uuid, cache_dir: PathBuf) -> Result<()> {
+    pub async fn persist_speech_recovery(
+        &self,
+        session_id: Uuid,
+        segments: Vec<SpeechSegment>,
+    ) -> Result<()> {
         self.run(move |connection| {
             let transaction = connection.transaction()?;
-            if transaction
-                .query_row(
-                    "SELECT 1 FROM sessions WHERE session_id = ?1",
-                    params![session_id.to_string()],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some()
-            {
-                reconcile_speech_directory(&transaction, session_id, &cache_dir)?;
+            for segment in segments {
+                upsert_speech_segment(&transaction, session_id, segment)?;
             }
-            transaction.execute(
-                "UPDATE speech_segments SET status = 'cancelled'
-                 WHERE session_id = ?1 AND status IN ('pending', 'playing')",
-                params![session_id.to_string()],
-            )?;
             transaction.commit()?;
             Ok(())
         })
         .await
     }
 
-    #[cfg(test)]
     pub async fn speech_segments(&self, session_id: Uuid) -> Result<Vec<SpeechSegment>> {
         self.run(move |connection| speech_segments_sync(connection, session_id))
             .await
@@ -348,6 +310,32 @@ impl Store {
         })
         .await
     }
+}
+
+fn upsert_speech_segment(
+    connection: &Connection,
+    session_id: Uuid,
+    segment: SpeechSegment,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO speech_segments(
+             session_id, token, segment_id, path, status, source_end_ns
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id, token) DO UPDATE SET
+             segment_id = excluded.segment_id,
+             path = excluded.path,
+             status = excluded.status,
+             source_end_ns = excluded.source_end_ns",
+        params![
+            session_id.to_string(),
+            segment.token as i64,
+            segment.segment_id,
+            segment.path.to_string_lossy(),
+            segment.status,
+            segment.source_end_ns,
+        ],
+    )?;
+    Ok(())
 }
 
 fn strip_legacy_deployment_fields(value: &mut serde_json::Value) {
@@ -563,21 +551,6 @@ fn speech_segments_sync(connection: &Connection, session_id: Uuid) -> Result<Vec
     Ok(segments)
 }
 
-fn speech_status(event_type: PlaybackEventType) -> &'static str {
-    match event_type {
-        PlaybackEventType::Queued => "pending",
-        PlaybackEventType::Started => "playing",
-        PlaybackEventType::Finished => "ready",
-        PlaybackEventType::Cancelled => "cancelled",
-        PlaybackEventType::Expired => "expired",
-        PlaybackEventType::Failed => "failed",
-    }
-}
-
-fn is_terminal_speech(status: &str) -> bool {
-    matches!(status, "ready" | "cancelled" | "expired" | "failed")
-}
-
 #[derive(Clone)]
 struct LegacyCursor {
     imported_id: String,
@@ -722,74 +695,6 @@ fn stable_legacy_cue_id(session_id: Uuid, line_number: usize, occurrence: u64) -
         format!("echonote-legacy-cue:{session_id}:{line_number}:{occurrence}").as_bytes(),
     )
     .to_string()
-}
-
-fn reconcile_speech_directory(
-    connection: &Connection,
-    session_id: Uuid,
-    directory: &Path,
-) -> Result<()> {
-    let mut paths = match fs::read_dir(directory) {
-        Ok(entries) => entries
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    paths.sort();
-    let prefix = format!("speech-{session_id}-");
-    for path in paths {
-        let Some(token) = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .and_then(|value| value.strip_prefix(&prefix))
-            .and_then(|value| value.strip_suffix(".wav"))
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let current = connection
-            .query_row(
-                "SELECT status FROM speech_segments WHERE session_id = ?1 AND token = ?2",
-                params![session_id.to_string(), token as i64],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if current.as_deref().is_some_and(is_terminal_speech) {
-            continue;
-        }
-        let status = match validate_wav(&path) {
-            Ok(()) => "ready",
-            Err(error) => {
-                tracing::warn!(path = %path.display(), "invalid recovered speech WAV: {error}");
-                "failed"
-            }
-        };
-        connection.execute(
-            "INSERT INTO speech_segments(session_id, token, segment_id, path, status, source_end_ns)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)
-             ON CONFLICT(session_id, token) DO UPDATE SET
-                 path = excluded.path,
-                 status = excluded.status",
-            params![
-                session_id.to_string(),
-                token as i64,
-                format!("recovered-{token}"),
-                path.to_string_lossy(),
-                status,
-            ],
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_wav(path: &Path) -> std::result::Result<(), String> {
-    let mut reader = hound::WavReader::open(path).map_err(|error| error.to_string())?;
-    for sample in reader.samples::<i16>() {
-        sample.map_err(|error| error.to_string())?;
-    }
-    Ok(())
 }
 
 fn migrate_speech(
@@ -1067,113 +972,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_reconciles_crash_left_wav_and_closes_pending_rows() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Store::open(root.path()).unwrap();
-        let cache = root.path().join("cache");
-        fs::create_dir_all(&cache).unwrap();
-        let id = Uuid::new_v4();
-        store
-            .save_session(StoredSession {
-                id,
-                config: PipelineConfig {
-                    output: OutputConfig::MacosSystem {
-                        voice: None,
-                        speech_rate: None,
-                    },
-                    ..PipelineConfig::default()
-                },
-                metadata: SessionMetadata {
-                    title: "crash recovery".into(),
-                    created_at_ms: 1,
-                    started_at_ms: None,
-                    ended_at_ms: None,
-                    audio_duration_us: 0,
-                },
-            })
-            .await
-            .unwrap();
-        write_wav(&cache.join(format!("speech-{id}-7.wav")));
-        store
-            .record_playback(
-                id,
-                cache.clone(),
-                PlaybackEvent {
-                    event_type: PlaybackEventType::Queued,
-                    segment_id: "pending".into(),
-                    token: 8,
-                    queue_duration_us: 0,
-                    actual_start_mono_ns: None,
-                    source_end_ns: None,
-                },
-            )
-            .await
-            .unwrap();
-        store.recover_speech(id, cache).await.unwrap();
-        let speech = store.speech_segments(id).await.unwrap();
-        assert_eq!(speech.len(), 2);
-        assert_eq!(speech[0].token, 7);
-        assert_eq!(speech[0].status, "ready");
-        assert_eq!(speech[1].token, 8);
-        assert_eq!(speech[1].status, "cancelled");
-    }
-
-    #[tokio::test]
-    async fn terminal_speech_manifest_entries_do_not_regress() {
-        let root = tempfile::tempdir().unwrap();
-        let store = Store::open(root.path()).unwrap();
-        let id = Uuid::new_v4();
-        store
-            .save_session(StoredSession {
-                id,
-                config: PipelineConfig::default(),
-                metadata: SessionMetadata {
-                    title: "speech".into(),
-                    created_at_ms: 1,
-                    started_at_ms: None,
-                    ended_at_ms: None,
-                    audio_duration_us: 0,
-                },
-            })
-            .await
-            .unwrap();
-        let mut applied = Vec::new();
-        for event_type in [
-            PlaybackEventType::Queued,
-            PlaybackEventType::Finished,
-            PlaybackEventType::Queued,
-            PlaybackEventType::Failed,
-        ] {
-            applied.push(
-                store
-                    .record_playback(
-                        id,
-                        root.path().to_path_buf(),
-                        PlaybackEvent {
-                            event_type,
-                            segment_id: "segment".into(),
-                            token: 9,
-                            queue_duration_us: 0,
-                            actual_start_mono_ns: None,
-                            source_end_ns: Some(800_000_000),
-                        },
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        assert_eq!(applied, [true, true, false, false]);
-        let speech = store.speech_segments(id).await.unwrap();
-        assert_eq!(speech.len(), 1);
-        assert_eq!(speech[0].status, "ready");
-        assert_eq!(store.next_speech_token(id).await.unwrap(), 10);
-        assert_eq!(
-            speech[0].path,
-            root.path().join(format!("speech-{id}-9.wav"))
-        );
-    }
-
-    #[tokio::test]
     async fn export_snapshot_keeps_original_cue_revisions_and_speech_manifest() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(root.path()).unwrap();
@@ -1196,27 +994,19 @@ mod tests {
             .record_cue(id, cue("cue", 1, 0, "snapshot draft"))
             .await
             .unwrap();
-        for event_type in [
-            PlaybackEventType::Queued,
-            PlaybackEventType::Started,
-            PlaybackEventType::Finished,
-        ] {
-            store
-                .record_playback(
-                    id,
-                    root.path().to_path_buf(),
-                    PlaybackEvent {
-                        event_type,
-                        segment_id: "segment-1".into(),
-                        token: 1,
-                        queue_duration_us: 0,
-                        actual_start_mono_ns: None,
-                        source_end_ns: Some(800_000_000),
-                    },
-                )
-                .await
-                .unwrap();
-        }
+        store
+            .persist_playback(
+                id,
+                SpeechSegment {
+                    token: 1,
+                    segment_id: "segment-1".into(),
+                    path: root.path().join(format!("speech-{id}-1.wav")),
+                    status: "ready".into(),
+                    source_end_ns: Some(800_000_000),
+                },
+            )
+            .await
+            .unwrap();
 
         let snapshot = store.export_snapshot(id).await.unwrap();
         store
@@ -1224,15 +1014,13 @@ mod tests {
             .await
             .unwrap();
         store
-            .record_playback(
+            .persist_playback(
                 id,
-                root.path().to_path_buf(),
-                PlaybackEvent {
-                    event_type: PlaybackEventType::Queued,
-                    segment_id: "segment-2".into(),
+                SpeechSegment {
                     token: 2,
-                    queue_duration_us: 0,
-                    actual_start_mono_ns: None,
+                    segment_id: "segment-2".into(),
+                    path: root.path().join(format!("speech-{id}-2.wav")),
+                    status: "pending".into(),
                     source_end_ns: Some(1_600_000_000),
                 },
             )

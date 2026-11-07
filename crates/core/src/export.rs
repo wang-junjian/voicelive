@@ -103,7 +103,7 @@ pub(crate) async fn export_wav(
     }
     let incomplete = segments
         .iter()
-        .filter(|segment| segment.status != "ready")
+        .filter(|segment| !crate::playback::is_exportable_speech(&segment.status))
         .map(|segment| format!("{} ({})", segment.token, segment.status))
         .collect::<Vec<_>>();
     if !incomplete.is_empty() {

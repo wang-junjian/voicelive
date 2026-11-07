@@ -2,6 +2,7 @@ mod error;
 mod export;
 mod lifecycle;
 mod output;
+mod playback;
 mod session;
 mod source;
 mod store;

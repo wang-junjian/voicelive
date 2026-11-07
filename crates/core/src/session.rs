@@ -2,6 +2,7 @@ use crate::error::{CoreError, Result};
 use crate::export::SubtitleExportFormat;
 use crate::lifecycle::Lifecycle;
 use crate::output::{OutputPaths, OutputRunner, OutputSignal, PlaybackControl};
+use crate::playback::PlaybackFacts;
 use crate::source::RunningSource;
 use crate::source::{SourceEvent, SourceStartOptions, start_source};
 use crate::store::{SessionMetadata, Store, StoredSession};
@@ -77,7 +78,9 @@ impl SessionManager {
         };
         let stored_sessions = store.load_sessions().await?;
         for stored in &stored_sessions {
-            store.recover_speech(stored.id, options.cache_dir()).await?;
+            PlaybackFacts::new(stored.id, options.cache_dir(), store.clone())
+                .recover()
+                .await?;
         }
         let mut restored = stored_sessions
             .into_iter()
@@ -234,74 +237,6 @@ struct Runtime {
     source_task: Option<JoinHandle<()>>,
 }
 
-struct PlaybackUpdate {
-    pending: u64,
-    count_event: bool,
-}
-
-#[derive(Default)]
-struct PlaybackLedger {
-    states: HashMap<u64, PlaybackEventType>,
-    terminal_order: VecDeque<u64>,
-    pending: u64,
-}
-
-impl PlaybackLedger {
-    fn apply(&mut self, token: u64, event_type: PlaybackEventType) -> PlaybackUpdate {
-        let previous = self.states.get(&token).copied();
-        let next = if previous.is_some_and(is_terminal_playback) {
-            previous.expect("terminal playback state")
-        } else if previous == Some(PlaybackEventType::Started)
-            && event_type == PlaybackEventType::Queued
-        {
-            PlaybackEventType::Started
-        } else {
-            event_type
-        };
-        let was_pending = previous.is_some_and(is_pending_playback);
-        let is_pending = is_pending_playback(next);
-        if was_pending && !is_pending {
-            self.pending = self.pending.saturating_sub(1);
-        } else if !was_pending && is_pending {
-            self.pending += 1;
-        }
-        let count_event = previous != Some(next) && next == event_type;
-        if count_event && is_terminal_playback(next) {
-            self.terminal_order.push_back(token);
-            while self.terminal_order.len() > 64 {
-                if let Some(expired) = self.terminal_order.pop_front() {
-                    self.states.remove(&expired);
-                }
-            }
-        }
-        self.states.insert(token, next);
-        PlaybackUpdate {
-            pending: self.pending,
-            count_event,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.states.clear();
-        self.terminal_order.clear();
-        self.pending = 0;
-    }
-}
-
-fn is_terminal_playback(event_type: PlaybackEventType) -> bool {
-    matches!(
-        event_type,
-        PlaybackEventType::Finished
-            | PlaybackEventType::Cancelled
-            | PlaybackEventType::Failed
-            | PlaybackEventType::Expired
-    )
-}
-
-fn is_pending_playback(event_type: PlaybackEventType) -> bool {
-    !is_terminal_playback(event_type)
-}
-
 pub struct Session {
     pub id: Uuid,
     config: RwLock<PipelineConfig>,
@@ -311,7 +246,7 @@ pub struct Session {
     timeline_offset_ns: AtomicU64,
     timeline_offsets: Mutex<HashMap<(u64, u64), i64>>,
     metrics: Mutex<SessionMetrics>,
-    playback: Mutex<PlaybackLedger>,
+    playback: PlaybackFacts,
     pending_speech: Mutex<VecDeque<TranslationEvent>>,
     last_error: Mutex<Option<String>>,
     runtime: Mutex<Option<Runtime>>,
@@ -362,6 +297,7 @@ impl Session {
     fn restore_with_store(stored: StoredSession, options: CoreOptions, store: Arc<Store>) -> Self {
         let (events, _) = broadcast::channel(512);
         let audio_duration_us = stored.metadata.audio_duration_us;
+        let playback = PlaybackFacts::new(stored.id, options.cache_dir(), store.clone());
         Self {
             id: stored.id,
             config: RwLock::new(stored.config),
@@ -374,7 +310,7 @@ impl Session {
                 captured_duration_us: audio_duration_us,
                 ..SessionMetrics::default()
             }),
-            playback: Mutex::new(PlaybackLedger::default()),
+            playback,
             pending_speech: Mutex::new(VecDeque::new()),
             last_error: Mutex::new(None),
             runtime: Mutex::new(None),
@@ -452,10 +388,14 @@ impl Session {
         }
     }
 
-    async fn emit(&self, kind: SessionEventKind) {
-        let _publication = self.event_publication.lock().await;
+    fn emit_locked(&self, kind: SessionEventKind) {
         let sequence = self.event_sequence.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.events.send(self.event(kind, sequence));
+    }
+
+    async fn emit(&self, kind: SessionEventKind) {
+        let _publication = self.event_publication.lock().await;
+        self.emit_locked(kind);
     }
 
     async fn set_state(&self, state: SessionState, message: Option<String>) {
@@ -723,7 +663,7 @@ impl Session {
             task.abort();
             let _ = task.await;
         }
-        let first_speech_token = self.store.next_speech_token(self.id).await?;
+        let first_speech_token = self.playback.next_token().await?;
         let (output_sender, output_receiver) = mpsc::channel(256);
         let mut runtime_guard = self.runtime.lock().await;
         let runtime = runtime_guard
@@ -822,7 +762,7 @@ impl Session {
             }
             metadata.ended_at_ms = None;
         }
-        self.playback.lock().await.clear();
+        self.playback.clear().await;
         {
             let mut metrics = self.metrics.lock().await;
             metrics.playback_pending = 0;
@@ -943,14 +883,10 @@ impl Session {
                 Err(_) => cleanup_error = Some("output stop timed out".into()),
             }
         }
-        if let Err(error) = self
-            .store
-            .recover_speech(self.id, self.options.cache_dir())
-            .await
-        {
+        if let Err(error) = self.playback.recover().await {
             cleanup_error = Some(error.to_string());
         }
-        self.playback.lock().await.clear();
+        self.playback.clear().await;
         self.pending_speech.lock().await.clear();
         {
             let mut metrics = self.metrics.lock().await;
@@ -1050,14 +986,10 @@ impl Session {
                 }
             }
         }
-        if let Err(error) = self
-            .store
-            .recover_speech(self.id, self.options.cache_dir())
-            .await
-        {
+        if let Err(error) = self.playback.recover().await {
             cleanup_error = Some(error.to_string());
         }
-        self.playback.lock().await.clear();
+        self.playback.clear().await;
         self.pending_speech.lock().await.clear();
         {
             let mut metrics = self.metrics.lock().await;
@@ -1226,23 +1158,19 @@ impl Session {
             if let Some(output) = old_output.as_mut() {
                 let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await;
             }
-            if let Err(error) = self
-                .store
-                .recover_speech(self.id, self.options.cache_dir())
-                .await
-            {
+            if let Err(error) = self.playback.recover().await {
                 self.fault("speech_storage", error.to_string(), true).await;
                 return Err(error);
             }
 
-            self.playback.lock().await.clear();
+            self.playback.clear().await;
             {
                 let mut metrics = self.metrics.lock().await;
                 metrics.playback_pending = 0;
                 metrics.tts_queue_depth = 0;
             }
 
-            let first_speech_token = self.store.next_speech_token(self.id).await?;
+            let first_speech_token = self.playback.next_token().await?;
             let (output_sender, output_receiver) = mpsc::channel(256);
             let mut output = match operation
                 .run_with_timeout(
@@ -1787,63 +1715,26 @@ async fn forward_output(
         match signal {
             OutputSignal::Playback(event) => {
                 if event.token != 0 {
-                    let cache_dir = session.options.cache_dir();
-                    match session
-                        .store
-                        .record_playback(session.id, cache_dir, event.clone())
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => continue,
+                    let publication = session.event_publication.lock().await;
+                    let mut metrics = session.metrics.lock().await;
+                    match session.playback.apply(event, &mut metrics).await {
+                        Ok(Some(published)) => {
+                            drop(metrics);
+                            session.emit_locked(SessionEventKind::Metrics(published.metrics));
+                            session.emit_locked(SessionEventKind::Playback(published.event));
+                        }
+                        Ok(None) => {}
                         Err(error) => {
+                            drop(metrics);
+                            drop(publication);
                             session
                                 .emit(SessionEventKind::Warning {
                                     code: "speech_storage".into(),
                                     message: format!("playback state was not persisted: {error}"),
                                 })
                                 .await;
-                            continue;
                         }
                     }
-                    let snapshot = {
-                        let update = session
-                            .playback
-                            .lock()
-                            .await
-                            .apply(event.token, event.event_type);
-                        let mut metrics = session.metrics.lock().await;
-                        metrics.playback_pending = update.pending;
-                        if update.count_event {
-                            match event.event_type {
-                                PlaybackEventType::Queued => {}
-                                PlaybackEventType::Started => {
-                                    metrics.playback_started += 1;
-                                    metrics.output_latency_us = event.queue_duration_us;
-                                    metrics.max_output_latency_us =
-                                        metrics.max_output_latency_us.max(event.queue_duration_us);
-                                    if let Some(source_end_ns) = event.source_end_ns {
-                                        let source_end_us = source_end_ns.max(0) as u64 / 1_000;
-                                        metrics.playback_lag_us = metrics
-                                            .captured_duration_us
-                                            .saturating_sub(source_end_us);
-                                        metrics.max_playback_lag_us = metrics
-                                            .max_playback_lag_us
-                                            .max(metrics.playback_lag_us);
-                                    }
-                                }
-                                PlaybackEventType::Finished => {
-                                    metrics.playback_finished += 1;
-                                }
-                                PlaybackEventType::Cancelled => {
-                                    metrics.playback_cancelled += 1;
-                                }
-                                PlaybackEventType::Failed | PlaybackEventType::Expired => {}
-                            }
-                        }
-                        metrics.clone()
-                    };
-                    session.emit(SessionEventKind::Metrics(snapshot)).await;
-                    session.emit(SessionEventKind::Playback(event)).await;
                 }
             }
             OutputSignal::QueueDepth(depth) => {
@@ -2174,7 +2065,7 @@ async fn reset_stale_backlog(
         Ordering::Release,
     );
     if flush_speech {
-        session.playback.lock().await.clear();
+        session.playback.clear().await;
     }
     {
         let mut metrics = session.metrics.lock().await;
@@ -2262,27 +2153,6 @@ mod tests {
         .expect("state transition timed out");
     }
 
-    #[test]
-    fn playback_ledger_tolerates_out_of_order_and_duplicate_events() {
-        let mut ledger = PlaybackLedger::default();
-        let terminal = ledger.apply(1, PlaybackEventType::Finished);
-        assert_eq!(terminal.pending, 0);
-        assert!(terminal.count_event);
-        assert!(!ledger.apply(1, PlaybackEventType::Queued).count_event);
-        assert_eq!(ledger.apply(1, PlaybackEventType::Started).pending, 0);
-        assert_eq!(ledger.apply(2, PlaybackEventType::Queued).pending, 1);
-        assert_eq!(ledger.apply(2, PlaybackEventType::Queued).pending, 1);
-        assert_eq!(ledger.apply(2, PlaybackEventType::Started).pending, 1);
-        let finished = ledger.apply(2, PlaybackEventType::Finished);
-        assert_eq!(finished.pending, 0);
-        assert!(finished.count_event);
-        assert!(!ledger.apply(2, PlaybackEventType::Finished).count_event);
-        for token in 10..1_000 {
-            ledger.apply(token, PlaybackEventType::Finished);
-        }
-        assert!(ledger.states.len() <= 64);
-    }
-
     #[tokio::test]
     async fn baseline_and_events_share_one_monotonic_cursor() {
         let root = tempfile::tempdir().unwrap();
@@ -2311,6 +2181,57 @@ mod tests {
         assert_eq!(second.sequence, event.sequence);
         assert_eq!(second.snapshot.title, "contract");
         assert_eq!(second.snapshot.event_sequence, second.sequence);
+    }
+
+    #[tokio::test]
+    async fn accepted_playback_publishes_metrics_then_fact_at_one_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::new_v4(),
+                deployment: DeploymentConfig::default(),
+            },
+        ));
+        session.persist().await.unwrap();
+        let (baseline, mut events) = session.subscribe_baseline().await.unwrap();
+        let (sender, receiver) = mpsc::channel(8);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(forward_output(
+            Arc::downgrade(&session),
+            receiver,
+            cancellation.clone(),
+        ));
+        sender
+            .send(OutputSignal::Playback(PlaybackEvent {
+                event_type: PlaybackEventType::Queued,
+                segment_id: "segment-1".into(),
+                token: 1,
+                queue_duration_us: 0,
+                actual_start_mono_ns: None,
+                source_end_ns: Some(800_000_000),
+            }))
+            .await
+            .unwrap();
+
+        let metrics_event = events.recv().await.unwrap();
+        let SessionEventKind::Metrics(metrics) = metrics_event.kind else {
+            panic!("expected metrics before playback");
+        };
+        assert_eq!(metrics.playback_pending, 1);
+        let playback_event = events.recv().await.unwrap();
+        assert!(matches!(playback_event.kind, SessionEventKind::Playback(_)));
+        assert_eq!(metrics_event.sequence, baseline.sequence + 1);
+        assert_eq!(playback_event.sequence, metrics_event.sequence + 1);
+
+        let (after, _) = session.subscribe_baseline().await.unwrap();
+        assert_eq!(after.sequence, playback_event.sequence);
+        assert_eq!(after.snapshot.event_sequence, playback_event.sequence);
+        assert_eq!(after.snapshot.metrics.playback_pending, 1);
+        cancellation.cancel();
+        let _ = task.await;
     }
 
     #[tokio::test]

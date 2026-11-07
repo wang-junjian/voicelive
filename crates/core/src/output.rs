@@ -1,4 +1,5 @@
 use crate::error::{CoreError, Result};
+use crate::playback::speech_path;
 use crate::time::monotonic_ns;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -295,27 +296,6 @@ struct PlayerEvent {
     depth: Option<u32>,
 }
 
-fn next_speech_token(cache_dir: &Path, session_id: Uuid) -> u64 {
-    let prefix = format!("speech-{session_id}-");
-    std::fs::read_dir(cache_dir)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(std::result::Result::ok)
-        .filter_map(|entry| {
-            entry
-                .file_name()
-                .to_str()?
-                .strip_prefix(&prefix)?
-                .strip_suffix(".wav")?
-                .parse::<u64>()
-                .ok()
-        })
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1)
-}
-
 struct MacOutputStart {
     player_path: String,
     cache_dir: String,
@@ -453,7 +433,7 @@ impl MacOutput {
         let worker_cache = PathBuf::from(cache_dir.as_str());
         let mut worker_voice = voice.unwrap_or_else(|| "Tingting".into());
         let worker = tokio::spawn(async move {
-            let mut next_token = first_token.max(next_speech_token(&worker_cache, session_id));
+            let mut next_token = first_token;
             let mut assembler = SpeechAssembler {
                 mode: latency_mode,
                 ..SpeechAssembler::default()
@@ -495,7 +475,7 @@ impl MacOutput {
                         .zip(event.source_end_ns)
                         .map(|(start, end)| ((end - start).max(0) / 1_000_000) as u64);
                     segments.lock().await.insert(token, event.clone());
-                    let path = worker_cache.join(format!("speech-{session_id}-{token}.wav"));
+                    let path = speech_path(&worker_cache, session_id, token);
                     let command = PlayerCommand {
                         cmd: "speak",
                         token: Some(token),
@@ -764,16 +744,6 @@ mod tests {
             generation_duration_us: 100,
             speakable: true,
         }
-    }
-
-    #[test]
-    fn next_token_scans_past_numbering_holes() {
-        let root = tempfile::tempdir().unwrap();
-        let id = Uuid::new_v4();
-        std::fs::write(root.path().join(format!("speech-{id}-1.wav")), []).unwrap();
-        std::fs::write(root.path().join(format!("speech-{id}-7.wav")), []).unwrap();
-        std::fs::write(root.path().join(format!("speech-{id}-ignored.tmp")), []).unwrap();
-        assert_eq!(next_speech_token(root.path(), id), 8);
     }
 
     #[test]
