@@ -119,3 +119,17 @@ SourceConfig → RunningSource → AudioFrame（100 ms）
 - 媒体资源由 `SIMULMT_MEDIA_MAX_BYTES`、`SIMULMT_MEDIA_MAX_OUTPUT_BYTES`、`SIMULMT_MEDIA_DECODE_TIMEOUT_SECS`、`SIMULMT_MEDIA_DISK_RESERVE_BYTES`、`SIMULMT_MEDIA_CONCURRENCY` 在启动期设置；这些不是会话配置。
 
 真实模型默认需要 `vendor/llama.cpp-hyv3/build/bin/llama-mtmd-cli` 和支持 Hy-SimulMT 的 llama.cpp 构建，以及约 18.4 GiB 的 `vendor/models/Hy-SimulMT-30B-A3B-Interleave-Q4_K_M.gguf`。`vendor/`、`runtime/` 和 `target/` 均为本地生成或下载内容。
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked as local Markdown files under `.scratch/<feature>/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles use their default label strings. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: root `GLOSSARY.md` and `docs/adr/`. See `docs/agents/domain.md`.
