@@ -3,13 +3,14 @@ use crate::export::SubtitleExportFormat;
 use crate::lifecycle::Lifecycle;
 use crate::output::{OutputPaths, OutputRunner, OutputSignal, PlaybackControl};
 use crate::playback::PlaybackFacts;
+use crate::run::{AudioRejection, CaptureRun, RunContext, TranslationRejection};
 use crate::source::RunningSource;
 use crate::source::{SourceEvent, SourceStartOptions, start_source};
 use crate::store::{SessionMetadata, Store, StoredSession};
 use crate::time::monotonic_ns;
 use crate::translator::{RunningTranslator, TranslatorSignal, start_translator};
 use simulmt_api::*;
-use simulmt_policy::{AudioChunker, SubtitleAssembler};
+use simulmt_policy::{AudioChunker, SubtitleAssembler, validate_normalized};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -242,9 +243,7 @@ pub struct Session {
     config: RwLock<PipelineConfig>,
     metadata: Mutex<SessionMetadata>,
     state: Mutex<SessionState>,
-    epoch: AtomicU64,
-    timeline_offset_ns: AtomicU64,
-    timeline_offsets: Mutex<HashMap<(u64, u64), i64>>,
+    run: CaptureRun,
     metrics: Mutex<SessionMetrics>,
     playback: PlaybackFacts,
     pending_speech: Mutex<VecDeque<TranslationEvent>>,
@@ -303,9 +302,7 @@ impl Session {
             config: RwLock::new(stored.config),
             metadata: Mutex::new(stored.metadata),
             state: Mutex::new(SessionState::Idle),
-            epoch: AtomicU64::new(1),
-            timeline_offset_ns: AtomicU64::new(0),
-            timeline_offsets: Mutex::new(HashMap::new()),
+            run: CaptureRun::new(stored.id, audio_duration_us),
             metrics: Mutex::new(SessionMetrics {
                 captured_duration_us: audio_duration_us,
                 ..SessionMetrics::default()
@@ -364,7 +361,7 @@ impl Session {
             instance_id: self.options.instance_id,
             session_id: self.id,
             event_sequence: self.event_sequence.load(Ordering::Acquire),
-            epoch: self.epoch.load(Ordering::Relaxed),
+            epoch: self.run.current_epoch(),
             state: *self.state.lock().await,
             title: metadata.title,
             created_at_ms: metadata.created_at_ms,
@@ -382,7 +379,7 @@ impl Session {
             instance_id: self.options.instance_id,
             session_id: self.id,
             sequence,
-            epoch: self.epoch.load(Ordering::Relaxed),
+            epoch: self.run.current_epoch(),
             emitted_mono_ns: monotonic_ns(),
             kind,
         }
@@ -396,6 +393,13 @@ impl Session {
     async fn emit(&self, kind: SessionEventKind) {
         let _publication = self.event_publication.lock().await;
         self.emit_locked(kind);
+    }
+
+    async fn accepts_run_context(&self, context: Option<RunContext>) -> bool {
+        match context {
+            Some(context) => self.run.context_is_current(context).await,
+            None => true,
+        }
     }
 
     async fn set_state(&self, state: SessionState, message: Option<String>) {
@@ -499,16 +503,20 @@ impl Session {
             TranslatorConfig::HySimulmt { direction, .. } => Some(direction),
             TranslatorConfig::Mock => None,
         };
-        let epoch = self.epoch.load(Ordering::Relaxed);
+        let epoch = self.run.current_epoch();
+        let source_generation = self.run.reserve_generation().await;
         let (sender, receiver) = mpsc::channel(256);
         let attached = operation
             .run_with_timeout(
                 LIFECYCLE_IO_TIMEOUT,
                 "attaching the resident translator",
                 async {
-                    translator.reattach(self.id, epoch, sender).await?;
+                    translator
+                        .reattach(self.id, epoch, source_generation, sender)
+                        .await?;
                     if let Some(direction) = direction {
-                        translator.set_direction(&direction).await?;
+                        let generation = self.run.reserve_generation().await;
+                        translator.set_direction(&direction, generation).await?;
                     }
                     Ok::<(), CoreError>(())
                 },
@@ -528,7 +536,7 @@ impl Session {
             source_task: None,
         });
         let weak = Arc::downgrade(self);
-        let task = tokio::spawn(forward_translator(weak, receiver, operation.token()));
+        let task = tokio::spawn(forward_translator(weak, receiver, None, operation.token()));
         if let Some(runtime) = self.runtime.lock().await.as_mut() {
             runtime.translator_task = Some(task);
         }
@@ -566,7 +574,7 @@ impl Session {
         self.set_state(SessionState::Preparing, Some("loading translator".into()))
             .await;
         let config = self.config.read().await.clone();
-        let epoch = self.epoch.load(Ordering::Relaxed);
+        let epoch = self.run.current_epoch();
         let (sender, receiver) = mpsc::channel(256);
         let mut translator = match operation
             .run_with_timeout(
@@ -612,7 +620,7 @@ impl Session {
         let weak = Arc::downgrade(self);
         let cancellation = operation.token();
         let task = tokio::spawn(async move {
-            forward_translator(weak, receiver, cancellation).await;
+            forward_translator(weak, receiver, None, cancellation).await;
         });
         if let Some(runtime) = self.runtime.lock().await.as_mut() {
             runtime.translator_task = Some(task);
@@ -641,17 +649,9 @@ impl Session {
         )
         .await;
         let config = self.config.read().await.clone();
-        let timeline_offset_ns = self
-            .metadata
-            .lock()
-            .await
-            .audio_duration_us
-            .saturating_mul(1_000);
-        self.timeline_offset_ns
-            .store(timeline_offset_ns, Ordering::Release);
-        self.timeline_offsets.lock().await.clear();
         self.pending_speech.lock().await.clear();
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let run_context = self.run.begin().await;
+        let epoch = run_context.epoch;
         let (translator_sender, translator_receiver) = mpsc::channel(256);
         let old_translator_task = self
             .runtime
@@ -678,7 +678,12 @@ impl Session {
                 .run_with_timeout(
                     LIFECYCLE_IO_TIMEOUT,
                     "resetting the translator for a new run",
-                    translator.reattach(self.id, epoch, translator_sender),
+                    translator.reattach(
+                        self.id,
+                        epoch,
+                        run_context.source_generation,
+                        translator_sender,
+                    ),
                 )
                 .await
         };
@@ -773,25 +778,30 @@ impl Session {
         }
         self.persist().await?;
         if operation.is_cancelled() {
+            self.run.close(epoch).await;
             return Err(CoreError::InvalidState(
                 "capture start was cancelled before commit".into(),
             ));
         }
+        self.run.activate(run_context).await?;
         self.set_state(SessionState::Running, Some("capturing".into()))
             .await;
         let translator_task = tokio::spawn(forward_translator(
             Arc::downgrade(self),
             translator_receiver,
-            operation.token(),
+            Some(run_context),
+            CancellationToken::new(),
         ));
         let output_task = tokio::spawn(forward_output(
             Arc::downgrade(self),
             output_receiver,
+            Some(run_context),
             operation.token(),
         ));
         let source_task = tokio::spawn(forward_source(
             Arc::downgrade(self),
             source_receiver,
+            Some(run_context),
             config.queue,
             operation.token(),
         ));
@@ -845,8 +855,9 @@ impl Session {
         if matches!(state, SessionState::Idle | SessionState::Stopping) {
             return Ok(());
         }
+        let drain_epoch = self.run.current_epoch();
+        self.run.begin_drain(drain_epoch).await;
         self.set_state(SessionState::Stopping, None).await;
-        self.epoch.fetch_add(1, Ordering::AcqRel);
         let (mut source, mut output, source_task, output_task, has_translator) = {
             let mut guard = self.runtime.lock().await;
             let has_translator = guard
@@ -869,13 +880,6 @@ impl Session {
             let _ = task.await;
         }
         let mut cleanup_error = None;
-        if let Some(source) = source.as_mut() {
-            match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => cleanup_error = Some(error.to_string()),
-                Err(_) => cleanup_error = Some("audio source stop timed out".into()),
-            }
-        }
         if let Some(output) = output.as_mut() {
             match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, output.stop()).await {
                 Ok(Ok(())) => {}
@@ -883,18 +887,34 @@ impl Session {
                 Err(_) => cleanup_error = Some("output stop timed out".into()),
             }
         }
+        if let Some(source) = source.as_mut() {
+            match tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => cleanup_error = Some(error.to_string()),
+                Err(_) => cleanup_error = Some("audio source stop timed out".into()),
+            }
+        }
         if let Err(error) = self.playback.recover().await {
             cleanup_error = Some(error.to_string());
         }
         self.playback.clear().await;
         self.pending_speech.lock().await.clear();
+        if self.run.current_context().await.is_some()
+            && let Err(error) = wait_for_model_drain(self, &operation.token()).await
+        {
+            self.emit(SessionEventKind::Warning {
+                code: "model_drain".into(),
+                message: error.to_string(),
+            })
+            .await;
+        }
         {
             let mut metrics = self.metrics.lock().await;
             metrics.playback_pending = 0;
             metrics.tts_queue_depth = 0;
         }
         self.flush_subtitle().await;
-        let captured_duration_us = self.metrics.lock().await.captured_duration_us;
+        let captured_duration_us = self.run.captured_duration_us().await;
         {
             let mut metadata = self.metadata.lock().await;
             metadata.audio_duration_us = captured_duration_us;
@@ -905,6 +925,7 @@ impl Session {
             }
         }
         self.persist().await?;
+        self.run.close(drain_epoch).await;
         if let Some(message) = cleanup_error {
             self.fault("resource_stop", message.clone(), true).await;
             return Err(CoreError::Output(message));
@@ -937,7 +958,7 @@ impl Session {
         operation: &crate::lifecycle::Operation<'_>,
     ) -> Result<()> {
         let state = *self.state.lock().await;
-        let captured_duration_us = self.metrics.lock().await.captured_duration_us;
+        let captured_duration_us = self.run.captured_duration_us().await;
         {
             let mut metadata = self.metadata.lock().await;
             metadata.audio_duration_us = captured_duration_us;
@@ -949,7 +970,7 @@ impl Session {
             self.persist().await?;
         }
         self.set_state(SessionState::Stopping, None).await;
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.run.invalidate().await;
         let runtime = self.runtime.lock().await.take();
         let mut cleanup_error = None;
         if let Some(mut runtime) = runtime {
@@ -1135,7 +1156,10 @@ impl Session {
                 self.fault("output_recovery", error.to_string(), true).await;
                 return Err(error);
             }
-            let epoch = self.epoch.load(Ordering::Relaxed);
+            let epoch = self.run.current_epoch();
+            let Some(run_context) = self.run.current_context().await else {
+                return Ok(());
+            };
             let (mut old_source, mut old_output, source_task, output_task) = {
                 let mut guard = self.runtime.lock().await;
                 let Some(runtime) = guard.as_mut() else {
@@ -1229,7 +1253,7 @@ impl Session {
             };
             let current_state = *self.state.lock().await;
             if operation.is_cancelled()
-                || self.epoch.load(Ordering::Acquire) != epoch
+                || self.run.current_epoch() != epoch
                 || current_state != SessionState::Running
             {
                 let _ = tokio::time::timeout(RESOURCE_STOP_TIMEOUT, source.stop()).await;
@@ -1241,11 +1265,13 @@ impl Session {
             let output_task = tokio::spawn(forward_output(
                 Arc::downgrade(&self),
                 output_receiver,
+                Some(run_context),
                 operation.token(),
             ));
             let source_task = tokio::spawn(forward_source(
                 Arc::downgrade(&self),
                 source_receiver,
+                Some(run_context),
                 config.queue,
                 operation.token(),
             ));
@@ -1445,6 +1471,14 @@ impl Session {
         } else {
             "Ava (Enhanced)"
         };
+        let changes_model_context = {
+            let config = self.config.read().await;
+            matches!(
+                &config.translator,
+                TranslatorConfig::HySimulmt { direction: current, .. }
+                    if current != &direction
+            )
+        };
         {
             let mut config = self.config.write().await;
             match &mut config.translator {
@@ -1472,7 +1506,20 @@ impl Session {
                             output.set_voice(voice.to_string()).await?;
                         }
                         if let Some(translator) = runtime.translator.as_mut() {
-                            translator.set_direction(&direction).await?;
+                            let generation = if changes_model_context {
+                                if state == SessionState::Running {
+                                    self.flush_subtitle().await;
+                                    self.run
+                                        .reset_source(self.run.current_epoch())
+                                        .await?
+                                        .source_generation
+                                } else {
+                                    self.run.reserve_generation().await
+                                }
+                            } else {
+                                self.run.reserve_generation().await
+                            };
+                            translator.set_direction(&direction, generation).await?;
                         }
                     }
                     Ok(())
@@ -1528,7 +1575,11 @@ impl Session {
                 .await?;
         }
         *self.config.write().await = config;
-        *self.metrics.lock().await = SessionMetrics::default();
+        let captured_duration_us = self.run.captured_duration_us().await;
+        *self.metrics.lock().await = SessionMetrics {
+            captured_duration_us,
+            ..SessionMetrics::default()
+        };
         *self.last_error.lock().await = None;
         self.persist().await?;
         self.emit(SessionEventKind::State {
@@ -1550,6 +1601,7 @@ fn now_ms() -> i64 {
 async fn forward_translator(
     weak: std::sync::Weak<Session>,
     mut receiver: mpsc::Receiver<TranslatorSignal>,
+    run_context: Option<RunContext>,
     cancellation: CancellationToken,
 ) {
     loop {
@@ -1559,6 +1611,9 @@ async fn forward_translator(
         };
         let Some(signal) = signal else { break };
         let Some(session) = weak.upgrade() else { break };
+        if !session.accepts_run_context(run_context).await {
+            continue;
+        }
         match signal {
             TranslatorSignal::Ready => {
                 if *session.state.lock().await == SessionState::Preparing {
@@ -1567,33 +1622,17 @@ async fn forward_translator(
                         .await;
                 }
             }
-            TranslatorSignal::Translation(mut event) => {
-                if event.epoch != session.epoch.load(Ordering::Relaxed) {
-                    continue;
-                }
-                let state = *session.state.lock().await;
-                if !matches!(state, SessionState::Running | SessionState::Paused) {
-                    // A model may finish an in-flight turn after capture stops. It must
-                    // not mutate a closed timeline or leak into the next capture run.
-                    continue;
-                }
-                event.segment_id = format!(
-                    "run-{}-source-{}-{}",
-                    event.epoch, event.source_generation, event.segment_id
-                );
-                let timeline_offset_ns = session
-                    .timeline_offsets
-                    .lock()
-                    .await
-                    .get(&(event.epoch, event.source_generation))
-                    .copied()
-                    .unwrap_or(0);
-                event.source_start_ns = event
-                    .source_start_ns
-                    .map(|timestamp| timestamp.saturating_add(timeline_offset_ns));
-                event.source_end_ns = event
-                    .source_end_ns
-                    .map(|timestamp| timestamp.saturating_add(timeline_offset_ns));
+            TranslatorSignal::Translation(event) => {
+                let event = match session.run.accept_translation(event).await {
+                    Ok(event) => event,
+                    Err(TranslationRejection::Stale) => continue,
+                    Err(TranslationRejection::Contract(error)) => {
+                        session
+                            .fault("translator_contract", error.to_string(), true)
+                            .await;
+                        continue;
+                    }
+                };
                 session.metrics.lock().await.translations += 1;
                 session
                     .emit(SessionEventKind::Translation(event.clone()))
@@ -1603,7 +1642,7 @@ async fn forward_translator(
                     let cue = session.subtitles.lock().await.push(&event);
                     session.record_subtitle_locked(cue).await;
                 }
-                if event.speakable {
+                if event.speakable && *session.state.lock().await == SessionState::Running {
                     let mut runtime = session.runtime.lock().await;
                     if let Some(output) = runtime.as_mut().and_then(|r| r.output.as_mut()) {
                         let submitted = tokio::select! {
@@ -1670,14 +1709,14 @@ async fn forward_translator(
                 epoch,
                 source_generation,
             } => {
-                let offset = session
-                    .timeline_offset_ns
-                    .load(Ordering::Acquire)
-                    .min(i64::MAX as u64) as i64;
-                let mut offsets = session.timeline_offsets.lock().await;
-                offsets.clear();
-                offsets.insert((epoch, source_generation), offset);
-                drop(offsets);
+                if !session
+                    .run
+                    .source_reset_is_current(epoch, source_generation)
+                    .await
+                {
+                    continue;
+                }
+                session.flush_subtitle().await;
                 let snapshot = {
                     let mut metrics = session.metrics.lock().await;
                     metrics.source_resets += 1;
@@ -1703,6 +1742,7 @@ async fn forward_translator(
 async fn forward_output(
     weak: std::sync::Weak<Session>,
     mut receiver: mpsc::Receiver<OutputSignal>,
+    run_context: Option<RunContext>,
     cancellation: CancellationToken,
 ) {
     loop {
@@ -1712,6 +1752,9 @@ async fn forward_output(
         };
         let Some(signal) = signal else { break };
         let Some(session) = weak.upgrade() else { break };
+        if !session.accepts_run_context(run_context).await {
+            continue;
+        }
         match signal {
             OutputSignal::Playback(event) => {
                 if event.token != 0 {
@@ -1777,6 +1820,7 @@ async fn forward_output(
 async fn forward_source(
     weak: std::sync::Weak<Session>,
     mut receiver: mpsc::Receiver<SourceEvent>,
+    run_context: Option<RunContext>,
     queue_policy: QueuePolicy,
     cancellation: CancellationToken,
 ) {
@@ -1790,21 +1834,34 @@ async fn forward_source(
             break;
         };
         let Some(session) = weak.upgrade() else { break };
+        if !session.accepts_run_context(run_context).await {
+            continue;
+        }
         match source_event {
             SourceEvent::Frame(frame) => {
-                if frame.epoch != session.epoch.load(Ordering::Relaxed) {
-                    continue;
+                if let Err(error) = validate_normalized(&frame) {
+                    session
+                        .fault("invalid_audio", error.to_string(), true)
+                        .await;
+                    break;
                 }
-                if *session.state.lock().await != SessionState::Running {
-                    let mut metrics = session.metrics.lock().await;
-                    metrics.dropped_frames += 1;
-                    metrics.dropped_duration_us += frame.duration_us as u64;
-                    continue;
-                }
+                let captured_duration_us = match session.run.accept_audio(&frame).await {
+                    Ok(duration) => duration,
+                    Err(AudioRejection::Stale) => continue,
+                    Err(AudioRejection::Contract(error)) => {
+                        session
+                            .fault("source_contract", error.to_string(), true)
+                            .await;
+                        break;
+                    }
+                };
                 {
                     let mut metrics = session.metrics.lock().await;
                     metrics.captured_frames += 1;
-                    metrics.captured_duration_us += frame.duration_us as u64;
+                    metrics.captured_duration_us = captured_duration_us;
+                }
+                if frame.discontinuity {
+                    session.flush_subtitle().await;
                 }
                 let blocks = match chunker.push(&frame) {
                     Ok(blocks) => blocks,
@@ -1838,6 +1895,7 @@ async fn forward_source(
                 metrics.dropped_duration_us += duration_us as u64;
             }
             SourceEvent::Ended => {
+                session.run.begin_drain(session.run.current_epoch()).await;
                 session
                     .emit(SessionEventKind::Warning {
                         code: "source_ended".into(),
@@ -1855,27 +1913,23 @@ async fn forward_source(
                     }
                     break;
                 }
-                let drain_epoch = session.epoch.load(Ordering::Acquire);
+                let drain_epoch = session.run.current_epoch();
                 let session = Arc::clone(&session);
                 tokio::spawn(async move {
                     let operation = session.lifecycle.begin().await;
                     let cancellation = operation.token();
-                    if operation.is_cancelled()
-                        || session.epoch.load(Ordering::Acquire) != drain_epoch
-                    {
+                    if operation.is_cancelled() || session.run.current_epoch() != drain_epoch {
                         return;
                     }
                     if let Err(error) = wait_for_model_drain(&session, &cancellation).await {
                         if !cancellation.is_cancelled()
-                            && session.epoch.load(Ordering::Acquire) == drain_epoch
+                            && session.run.current_epoch() == drain_epoch
                         {
                             session.fault("model_drain", error.to_string(), true).await;
                         }
                         return;
                     }
-                    if cancellation.is_cancelled()
-                        || session.epoch.load(Ordering::Acquire) != drain_epoch
-                    {
+                    if cancellation.is_cancelled() || session.run.current_epoch() != drain_epoch {
                         return;
                     }
                     session.flush_subtitle().await;
@@ -1897,7 +1951,7 @@ async fn forward_source(
                     drop(runtime);
                     if let Err(error) = wait_for_playback_drain(&session, &cancellation).await {
                         if !cancellation.is_cancelled()
-                            && session.epoch.load(Ordering::Acquire) == drain_epoch
+                            && session.run.current_epoch() == drain_epoch
                         {
                             session
                                 .fault("playback_drain", error.to_string(), true)
@@ -1905,9 +1959,7 @@ async fn forward_source(
                         }
                         return;
                     }
-                    if cancellation.is_cancelled()
-                        || session.epoch.load(Ordering::Acquire) != drain_epoch
-                    {
+                    if cancellation.is_cancelled() || session.run.current_epoch() != drain_epoch {
                         return;
                     }
                     if let Err(error) = session.stop_capture_with_operation(None, &operation).await
@@ -2029,6 +2081,11 @@ async fn reset_stale_backlog(
     flush_speech: bool,
     cancellation: &CancellationToken,
 ) -> Result<()> {
+    let run_context = session
+        .run
+        .reset_source(session.run.current_epoch())
+        .await?;
+    session.flush_subtitle().await;
     let mut runtime = tokio::select! {
         _ = cancellation.cancelled() => {
             return Err(CoreError::InvalidState("stale backlog reset was cancelled".into()));
@@ -2047,7 +2104,7 @@ async fn reset_stale_backlog(
                 .translator
                 .as_mut()
                 .ok_or_else(|| CoreError::InvalidState("translator missing".into()))?;
-            translator.reset_source().await?;
+            translator.reset_source(run_context.source_generation).await?;
             if flush_speech
                 && let Some(output) = runtime.output.as_mut()
             {
@@ -2059,11 +2116,6 @@ async fn reset_stale_backlog(
     drop(runtime);
     result?;
 
-    let captured_duration_us = session.metrics.lock().await.captured_duration_us;
-    session.timeline_offset_ns.store(
-        captured_duration_us.saturating_mul(1_000),
-        Ordering::Release,
-    );
     if flush_speech {
         session.playback.clear().await;
     }
@@ -2202,6 +2254,7 @@ mod tests {
         let task = tokio::spawn(forward_output(
             Arc::downgrade(&session),
             receiver,
+            None,
             cancellation.clone(),
         ));
         sender
@@ -2376,6 +2429,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_audio_does_not_advance_the_source_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig::default(),
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
+                deployment: DeploymentConfig::default(),
+            },
+        ));
+        let context = session.run.begin().await;
+        session.run.activate(context).await.unwrap();
+        *session.state.lock().await = SessionState::Running;
+        let (sender, receiver) = mpsc::channel(2);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(forward_source(
+            Arc::downgrade(&session),
+            receiver,
+            Some(context),
+            QueuePolicy::default(),
+            cancellation.clone(),
+        ));
+        sender
+            .send(SourceEvent::Frame(AudioFrame {
+                session_id: session.id,
+                epoch: context.epoch,
+                sequence: 0,
+                source_id: "test".into(),
+                format: AudioFormat::default(),
+                payload: vec![0],
+                source_pts_ns: None,
+                capture_mono_ns: 0,
+                ingress_mono_ns: 0,
+                duration_us: 100_000,
+                discontinuity: false,
+            }))
+            .await
+            .unwrap();
+        wait_for_state(&session, SessionState::Faulted).await;
+        assert_eq!(session.run.captured_duration_us().await, 0);
+        assert_eq!(session.snapshot().await.metrics.captured_duration_us, 0);
+        cancellation.cancel();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
     async fn stop_cancels_a_blocked_model_write() {
         struct BlockingTranslator {
             entered: Arc<tokio::sync::Notify>,
@@ -2393,7 +2493,7 @@ mod tests {
                 Ok(())
             }
 
-            async fn reset_source(&mut self) -> Result<()> {
+            async fn reset_source(&mut self, _source_generation: u64) -> Result<()> {
                 Ok(())
             }
 
@@ -2401,12 +2501,17 @@ mod tests {
                 &mut self,
                 _session_id: Uuid,
                 _epoch: u64,
+                _source_generation: u64,
                 _sender: mpsc::Sender<TranslatorSignal>,
             ) -> Result<()> {
                 Ok(())
             }
 
-            async fn set_direction(&mut self, _direction: &str) -> Result<()> {
+            async fn set_direction(
+                &mut self,
+                _direction: &str,
+                _source_generation: u64,
+            ) -> Result<()> {
                 Ok(())
             }
 
@@ -2441,6 +2546,8 @@ mod tests {
             source_task: None,
         });
         *session.state.lock().await = SessionState::Running;
+        let run_context = session.run.begin().await;
+        session.run.activate(run_context).await.unwrap();
         let operation = session.lifecycle.begin().await;
         let cancellation = operation.token();
         drop(operation);
@@ -2448,13 +2555,14 @@ mod tests {
         let task = tokio::spawn(forward_source(
             Arc::downgrade(&session),
             receiver,
+            Some(run_context),
             QueuePolicy::default(),
             cancellation,
         ));
         sender
             .send(SourceEvent::Frame(AudioFrame {
                 session_id: session.id,
-                epoch: 1,
+                epoch: run_context.epoch,
                 sequence: 0,
                 source_id: "test".into(),
                 format: AudioFormat {
@@ -2572,6 +2680,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconfigure_preserves_the_cumulative_source_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let options = CoreOptions {
+            audio_host: "unused".into(),
+            runtime_dir: root.path().to_string_lossy().into_owned(),
+            instance_id: Uuid::nil(),
+            deployment: DeploymentConfig::default(),
+        };
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: Some(1) },
+                ..PipelineConfig::default()
+            },
+            options.clone(),
+        ));
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        session.start().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        session.stop_model().await.unwrap();
+        session
+            .reconfigure(PipelineConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            session.snapshot().await.metrics.captured_duration_us,
+            100_000
+        );
+
+        let restored = Session::restore(
+            StoredSession {
+                id: session.id,
+                config: PipelineConfig::default(),
+                metadata: session.metadata.lock().await.clone(),
+            },
+            options,
+        );
+        assert_eq!(
+            restored.snapshot().await.metrics.captured_duration_us,
+            100_000
+        );
+    }
+
+    #[tokio::test]
     async fn configuring_session_cannot_be_bypassed_for_model_ownership() {
         let root = tempfile::tempdir().unwrap();
         let manager = SessionManager::new(CoreOptions {
@@ -2612,18 +2764,23 @@ mod tests {
                 Ok(())
             }
 
-            async fn reset_source(&mut self) -> Result<()> {
+            async fn reset_source(&mut self, _source_generation: u64) -> Result<()> {
                 Ok(())
             }
             async fn reattach(
                 &mut self,
                 _session_id: Uuid,
                 _epoch: u64,
+                _source_generation: u64,
                 _sender: mpsc::Sender<TranslatorSignal>,
             ) -> Result<()> {
                 Ok(())
             }
-            async fn set_direction(&mut self, _direction: &str) -> Result<()> {
+            async fn set_direction(
+                &mut self,
+                _direction: &str,
+                _source_generation: u64,
+            ) -> Result<()> {
                 Ok(())
             }
             async fn stop(&mut self) -> Result<()> {
@@ -2674,10 +2831,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_stop_drains_accepted_translation_before_closing_run() {
+        struct DelayedTranslator {
+            session_id: Uuid,
+            epoch: u64,
+            source_generation: u64,
+            sender: Option<mpsc::Sender<TranslatorSignal>>,
+        }
+
+        #[async_trait::async_trait]
+        impl RunningTranslator for DelayedTranslator {
+            async fn push_audio(&mut self, frame: AudioFrame) -> Result<()> {
+                let sender = self.sender.clone().unwrap();
+                let session_id = self.session_id;
+                let epoch = self.epoch;
+                let source_generation = self.source_generation;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let mut event = test_translation(session_id, epoch, "delayed", "drained");
+                    event.source_generation = source_generation;
+                    event.speakable = false;
+                    let _ = sender.send(TranslatorSignal::Translation(event)).await;
+                    let _ = sender
+                        .send(TranslatorSignal::Completed {
+                            duration_us: frame.duration_us,
+                            context_position: 0,
+                        })
+                        .await;
+                });
+                Ok(())
+            }
+
+            async fn recover(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            async fn reset_source(&mut self, source_generation: u64) -> Result<()> {
+                self.source_generation = source_generation;
+                Ok(())
+            }
+
+            async fn reattach(
+                &mut self,
+                session_id: Uuid,
+                epoch: u64,
+                source_generation: u64,
+                sender: mpsc::Sender<TranslatorSignal>,
+            ) -> Result<()> {
+                self.session_id = session_id;
+                self.epoch = epoch;
+                self.source_generation = source_generation;
+                self.sender = Some(sender);
+                Ok(())
+            }
+
+            async fn set_direction(
+                &mut self,
+                _direction: &str,
+                _source_generation: u64,
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            async fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let session = Arc::new(Session::new(
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
+            CoreOptions {
+                audio_host: "unused".into(),
+                runtime_dir: root.path().to_string_lossy().into_owned(),
+                instance_id: Uuid::nil(),
+                deployment: DeploymentConfig::default(),
+            },
+        ));
+        *session.runtime.lock().await = Some(Runtime {
+            translator: Some(Box::new(DelayedTranslator {
+                session_id: session.id,
+                epoch: 1,
+                source_generation: 0,
+                sender: None,
+            })),
+            output: None,
+            source: None,
+            translator_task: None,
+            output_task: None,
+            source_task: None,
+        });
+        *session.state.lock().await = SessionState::Ready;
+        session.start().await.unwrap();
+        let context = session.run.current_context().await.unwrap();
+        forward_model_block(
+            &session,
+            AudioFrame {
+                session_id: session.id,
+                epoch: context.epoch,
+                sequence: 0,
+                source_id: "test".into(),
+                format: AudioFormat {
+                    frame_duration_us: MODEL_BLOCK_US,
+                    ..AudioFormat::default()
+                },
+                payload: vec![0; 25_600],
+                source_pts_ns: None,
+                capture_mono_ns: 0,
+                ingress_mono_ns: 0,
+                duration_us: MODEL_BLOCK_US,
+                discontinuity: false,
+            },
+            &QueuePolicy::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        session.stop().await.unwrap();
+        assert!(
+            session
+                .history()
+                .await
+                .unwrap()
+                .iter()
+                .any(|cue| { cue.segment_ids.iter().any(|id| id.ends_with("delayed")) })
+        );
+        assert_eq!(session.snapshot().await.state, SessionState::Ready);
+        session.stop_model().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stale_ahead_policy_resets_to_the_live_edge() {
         let root = tempfile::tempdir().unwrap();
         let session = Arc::new(Session::new(
-            PipelineConfig::default(),
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
@@ -2687,11 +2980,29 @@ mod tests {
         ));
         session.prepare().await.unwrap();
         wait_for_state(&session, SessionState::Ready).await;
-        *session.state.lock().await = SessionState::Running;
+        session.start().await.unwrap();
+        let run_context = session.run.current_context().await.unwrap();
+        let captured_duration_us = session
+            .run
+            .accept_audio(&AudioFrame {
+                session_id: session.id,
+                epoch: run_context.epoch,
+                sequence: 0,
+                source_id: "test".into(),
+                format: AudioFormat::default(),
+                payload: Vec::new(),
+                source_pts_ns: None,
+                capture_mono_ns: 0,
+                ingress_mono_ns: 0,
+                duration_us: 20_000_000,
+                discontinuity: false,
+            })
+            .await
+            .unwrap();
         {
             let mut metrics = session.metrics.lock().await;
             metrics.sent_duration_us = 20_000_000;
-            metrics.captured_duration_us = 20_000_000;
+            metrics.captured_duration_us = captured_duration_us;
         }
         let policy = QueuePolicy {
             max_model_backlog_us: 10_000_000,
@@ -2702,7 +3013,7 @@ mod tests {
             &session,
             AudioFrame {
                 session_id: session.id,
-                epoch: 1,
+                epoch: run_context.epoch,
                 sequence: 0,
                 source_id: "test".into(),
                 format: AudioFormat {
@@ -2803,6 +3114,7 @@ mod tests {
         let task = tokio::spawn(forward_translator(
             Arc::downgrade(&session),
             receiver,
+            None,
             cancellation.clone(),
         ));
         sender
@@ -2814,13 +3126,15 @@ mod tests {
             )))
             .await
             .unwrap();
+        let mut fresh = test_translation(session.id, new_epoch, "fresh-run", "fresh content");
+        fresh.source_generation = session
+            .run
+            .current_context()
+            .await
+            .unwrap()
+            .source_generation;
         sender
-            .send(TranslatorSignal::Translation(test_translation(
-                session.id,
-                new_epoch,
-                "fresh-run",
-                "fresh content",
-            )))
+            .send(TranslatorSignal::Translation(fresh))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -2853,10 +3167,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn translation_events_use_their_own_source_generation_timeline() {
+    async fn current_run_rejects_translation_without_source_timing() {
         let root = tempfile::tempdir().unwrap();
         let session = Arc::new(Session::new(
-            PipelineConfig::default(),
+            PipelineConfig {
+                source: SourceConfig::Mock { frames: None },
+                ..PipelineConfig::default()
+            },
             CoreOptions {
                 audio_host: "unused".into(),
                 runtime_dir: root.path().to_string_lossy().into_owned(),
@@ -2864,57 +3181,48 @@ mod tests {
                 deployment: DeploymentConfig::default(),
             },
         ));
-        *session.state.lock().await = SessionState::Running;
-        session
-            .timeline_offsets
-            .lock()
-            .await
-            .insert((1, 1), 10_000_000_000);
-        session
-            .timeline_offset_ns
-            .store(20_000_000_000, Ordering::Release);
+        session.prepare().await.unwrap();
+        wait_for_state(&session, SessionState::Ready).await;
+        session.start().await.unwrap();
+        let epoch = session.snapshot().await.epoch;
         let (sender, receiver) = mpsc::channel(8);
         let cancellation = CancellationToken::new();
         let task = tokio::spawn(forward_translator(
             Arc::downgrade(&session),
             receiver,
+            None,
             cancellation.clone(),
         ));
-        let mut old = test_translation(session.id, 1, "old", "old.");
-        old.source_generation = 1;
-        old.speakable = false;
-        sender
-            .send(TranslatorSignal::Translation(old))
+        let mut invalid = test_translation(session.id, epoch, "missing-time", "invalid");
+        invalid.source_generation = session
+            .run
+            .current_context()
             .await
-            .unwrap();
+            .unwrap()
+            .source_generation;
+        invalid.source_start_ns = None;
+        invalid.speakable = false;
         sender
-            .send(TranslatorSignal::SourceReset {
-                epoch: 1,
-                source_generation: 2,
-            })
-            .await
-            .unwrap();
-        let mut new = test_translation(session.id, 1, "new", "new.");
-        new.source_generation = 2;
-        new.speakable = false;
-        sender
-            .send(TranslatorSignal::Translation(new))
+            .send(TranslatorSignal::Translation(invalid))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while session.history().await.unwrap().len() < 2 {
+            loop {
+                if session.snapshot().await.state == SessionState::Faulted
+                    || !session.history().await.unwrap().is_empty()
+                {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .unwrap();
-        let history = session.history().await.unwrap();
-        assert_eq!(history[0].source_start_ns, 10_000_000_000);
-        assert_eq!(history[1].source_start_ns, 20_000_000_000);
-        assert!(history[0].segment_ids[0].contains("source-1-"));
-        assert!(history[1].segment_ids[0].contains("source-2-"));
+        assert_eq!(session.snapshot().await.state, SessionState::Faulted);
+        assert!(session.history().await.unwrap().is_empty());
         cancellation.cancel();
         let _ = task.await;
+        session.stop_model().await.unwrap();
     }
 
     #[tokio::test]
@@ -2955,15 +3263,23 @@ mod tests {
         let task = tokio::spawn(forward_translator(
             Arc::downgrade(&session),
             receiver,
+            None,
             cancellation.clone(),
         ));
+        let mut during_recovery = test_translation(
+            session.id,
+            session.snapshot().await.epoch,
+            "during-recovery",
+            "queued during recovery",
+        );
+        during_recovery.source_generation = session
+            .run
+            .current_context()
+            .await
+            .unwrap()
+            .source_generation;
         sender
-            .send(TranslatorSignal::Translation(test_translation(
-                session.id,
-                session.snapshot().await.epoch,
-                "during-recovery",
-                "queued during recovery",
-            )))
+            .send(TranslatorSignal::Translation(during_recovery))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -3008,6 +3324,7 @@ mod tests {
         let task = tokio::spawn(forward_output(
             Arc::downgrade(&session),
             receiver,
+            None,
             cancellation.clone(),
         ));
         let mut events = session.subscribe();
@@ -3145,6 +3462,49 @@ mod tests {
         let history = restored.history().await.unwrap();
         assert_eq!(history.len(), 2);
         assert!(history.iter().any(|cue| cue.cue_id == "cue-0"));
+    }
+
+    #[tokio::test]
+    async fn segment_identity_does_not_repeat_after_core_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let options = CoreOptions {
+            audio_host: "unused".into(),
+            runtime_dir: root.path().to_string_lossy().into_owned(),
+            instance_id: Uuid::new_v4(),
+            deployment: DeploymentConfig::default(),
+        };
+        let config = PipelineConfig {
+            source: SourceConfig::Mock { frames: Some(1) },
+            ..PipelineConfig::default()
+        };
+        let first = Arc::new(Session::new(config.clone(), options.clone()));
+        first.prepare().await.unwrap();
+        wait_for_state(&first, SessionState::Ready).await;
+        first.start().await.unwrap();
+        wait_for_state(&first, SessionState::Ready).await;
+        let first_segment = first.history().await.unwrap()[0].segment_ids[0].clone();
+        let stored = StoredSession {
+            id: first.id,
+            config,
+            metadata: first.metadata.lock().await.clone(),
+        };
+        first.stop_model().await.unwrap();
+
+        let restored = Arc::new(Session::restore(
+            stored,
+            CoreOptions {
+                instance_id: Uuid::new_v4(),
+                ..options
+            },
+        ));
+        restored.prepare().await.unwrap();
+        wait_for_state(&restored, SessionState::Ready).await;
+        restored.start().await.unwrap();
+        wait_for_state(&restored, SessionState::Ready).await;
+        let history = restored.history().await.unwrap();
+        let restored_segment = history.last().unwrap().segment_ids[0].clone();
+        assert_ne!(first_segment, restored_segment);
+        restored.stop_model().await.unwrap();
     }
 
     #[cfg(unix)]

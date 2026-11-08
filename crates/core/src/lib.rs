@@ -3,6 +3,7 @@ mod export;
 mod lifecycle;
 mod output;
 mod playback;
+mod run;
 mod session;
 mod source;
 mod store;

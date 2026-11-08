@@ -45,14 +45,15 @@ pub enum TranslatorSignal {
 pub trait RunningTranslator: Send {
     async fn push_audio(&mut self, frame: AudioFrame) -> Result<()>;
     async fn recover(&mut self) -> Result<()>;
-    async fn reset_source(&mut self) -> Result<()>;
+    async fn reset_source(&mut self, source_generation: u64) -> Result<()>;
     async fn reattach(
         &mut self,
         session_id: Uuid,
         epoch: u64,
+        source_generation: u64,
         sender: mpsc::Sender<TranslatorSignal>,
     ) -> Result<()>;
-    async fn set_direction(&mut self, direction: &str) -> Result<()>;
+    async fn set_direction(&mut self, direction: &str, source_generation: u64) -> Result<()>;
     async fn stop(&mut self) -> Result<()>;
 }
 
@@ -114,8 +115,8 @@ impl RunningTranslator for MockTranslator {
         Ok(())
     }
 
-    async fn reset_source(&mut self) -> Result<()> {
-        self.source_generation += 1;
+    async fn reset_source(&mut self, source_generation: u64) -> Result<()> {
+        self.source_generation = source_generation;
         self.index = 0;
         self.timeline_us = 0;
         let _ = self
@@ -132,6 +133,7 @@ impl RunningTranslator for MockTranslator {
         &mut self,
         session_id: Uuid,
         epoch: u64,
+        source_generation: u64,
         sender: mpsc::Sender<TranslatorSignal>,
     ) -> Result<()> {
         self.session_id = session_id;
@@ -139,10 +141,10 @@ impl RunningTranslator for MockTranslator {
         self.sender = sender;
         self.index = 0;
         self.timeline_us = 0;
-        self.reset_source().await
+        self.reset_source(source_generation).await
     }
 
-    async fn set_direction(&mut self, _direction: &str) -> Result<()> {
+    async fn set_direction(&mut self, _direction: &str, _source_generation: u64) -> Result<()> {
         Ok(())
     }
 
@@ -305,8 +307,9 @@ impl RunningTranslator for HyTranslator {
         self.restart("model stream ended").await
     }
 
-    async fn reset_source(&mut self) -> Result<()> {
-        let source_generation = self.source_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    async fn reset_source(&mut self, source_generation: u64) -> Result<()> {
+        self.source_generation
+            .store(source_generation, Ordering::Release);
         self.pending_audio
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -339,11 +342,12 @@ impl RunningTranslator for HyTranslator {
         &mut self,
         session_id: Uuid,
         epoch: u64,
+        source_generation: u64,
         sender: mpsc::Sender<TranslatorSignal>,
     ) -> Result<()> {
         // A new session must not inherit audio or linguistic context, but the
         // expensive model process and its loaded weights remain resident.
-        self.reset_source().await?;
+        self.reset_source(source_generation).await?;
         self.session_id = session_id;
         self.epoch = epoch;
         self.sender = sender.clone();
@@ -355,7 +359,7 @@ impl RunningTranslator for HyTranslator {
         Ok(())
     }
 
-    async fn set_direction(&mut self, direction: &str) -> Result<()> {
+    async fn set_direction(&mut self, direction: &str, source_generation: u64) -> Result<()> {
         if !matches!(direction, "en-zh" | "zh-en") {
             return Err(CoreError::InvalidConfig(format!(
                 "unsupported translation direction: {direction}"
@@ -365,7 +369,8 @@ impl RunningTranslator for HyTranslator {
             return Ok(());
         }
         self.config.direction = direction.to_string();
-        self.source_generation.fetch_add(1, Ordering::AcqRel);
+        self.source_generation
+            .store(source_generation, Ordering::Release);
         self.pending_audio
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1054,7 +1059,7 @@ while True:
         let first = next_translation(&mut receiver).await;
         assert_eq!(first.source_start_ns, Some(0));
 
-        translator.reset_source().await.unwrap();
+        translator.reset_source(1).await.unwrap();
         wait_for_source_reset(&mut receiver).await;
         assert!(translator.pending_audio.lock().unwrap().is_empty());
         assert!(translator.handoff.lock().unwrap().is_empty());
@@ -1083,7 +1088,7 @@ while True:
         let new_session = Uuid::new_v4();
         let (new_sender, mut new_receiver) = mpsc::channel(64);
         translator
-            .reattach(new_session, 7, new_sender)
+            .reattach(new_session, 7, 1, new_sender)
             .await
             .unwrap();
         assert!(translator.handoff.lock().unwrap().is_empty());
