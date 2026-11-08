@@ -3700,11 +3700,11 @@ mod tests {
         assert_eq!(history.len(), 600);
         assert_eq!(history.first().unwrap().cue_id, "cue-0");
         assert_eq!(history.last().unwrap().cue_id, "cue-599");
-        assert!(root.join("echonote.db").exists());
+        assert!(root.join("voicelive.db").exists());
 
         session.clear_history().await.unwrap();
         assert!(session.history().await.unwrap().is_empty());
-        assert!(root.join("echonote.db").exists());
+        assert!(root.join("voicelive.db").exists());
         assert_eq!(session.store.history(session.id).await.unwrap(), Vec::new());
         tokio::fs::remove_dir_all(root).await.unwrap();
     }

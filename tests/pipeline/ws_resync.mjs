@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "echonote-ws-contract-"));
+const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "voicelive-ws-contract-"));
 const binary = path.join(root, "target", "debug", "simulmt-app");
 const logPath = path.join(runtime, "core.log");
 let core = null;

@@ -31,7 +31,7 @@ for _ in $(seq 1 80); do
   sleep 0.25
 done
 if [ "$READY" != 1 ]; then
-  echo "EchoNote Core did not become ready" >&2
+  echo "VoiceLive Core did not become ready" >&2
   exit 1
 fi
 export SIMULMT_UI_URL="$(python3 - "$SIMULMT_RUNTIME_DIR/bootstrap.json" "$DEBUG" <<'PY'
@@ -51,6 +51,6 @@ if [ "$OPEN" = 1 ]; then
   DESKTOP_PID=$!
   wait "$DESKTOP_PID" || true
 else
-  echo "EchoNote console: ${SIMULMT_UI_URL}"
+  echo "VoiceLive console: ${SIMULMT_UI_URL}"
   wait "$CORE_PID"
 fi

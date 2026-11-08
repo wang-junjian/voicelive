@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-回响 EchoNote 是本地实时语音同传工作台：Rust Core 负责会话、音频管线、模型与播放编排，Swift 原生进程负责 macOS 音频采集、TTS/播放和 WKWebView 桌面壳。完整音源与播放器目前以 macOS 为目标平台；默认真实模型是本地 Hy-SimulMT GGUF。
+声译 VoiceLive 是本地实时语音同传工作台：Rust Core 负责会话、音频管线、模型与播放编排，Swift 原生进程负责 macOS 音频采集、TTS/播放和 WKWebView 桌面壳。完整音源与播放器目前以 macOS 为目标平台；默认真实模型是本地 Hy-SimulMT GGUF。
+
+## Git 工作流
+
+- 默认直接在 `main` 主分支上开发，不要自动创建或切换功能分支。
+- 只有用户明确要求时，才创建或切换到其他分支。
 
 ## 常用命令
 
@@ -40,7 +45,7 @@ cargo test -p simulmt-core mock_session_covers_complete_lifecycle -- --nocapture
 
 ```bash
 # 先构建；脚本自行在随机端口启动 Core，使用临时 runtime 和 mock 链路
-python3 tests/pipeline/acceptance_echonote.py
+python3 tests/pipeline/acceptance_voicelive.py
 python3 tests/pipeline/security_boundary.py   # 本机认证、来源、路径和资源上限负向验收
 node tests/pipeline/ws_resync.mjs           # baseline、连续序号、重连、instance 和错误契约
 
@@ -84,7 +89,7 @@ SourceConfig → RunningSource → AudioFrame（100 ms）
 
 - 模型启动与采集启动分离：`prepare` 进入 `Ready`，`start` 才创建播放器和音源；`stop` 只停止采集/播放并保留模型，`stop_model` 才终止模型、递增 epoch 并回到 `Idle`。
 - 全局只有一个常驻模型。`SessionManager::prepare` 会将其他会话的 `Ready` 模型 detach/adopt 到新会话；`RunningTranslator::reattach` 重定向事件并清理音频和语言上下文，避免重复加载权重。新建会话也会停止其他会话的活动采集。
-- `runtime/echonote.db` 使用 SQLite WAL、单写入连接和 `synchronous=FULL`，保存会话、字幕修订、segment 关联、语音清单和迁移账本；WAV/媒体仍存文件系统。字幕与播放状态先提交数据库再广播。内存历史最多 512 条，数据库历史完整保留。重启只恢复配置、元数据和字幕，所有运行状态恢复为 `Idle`，不会恢复进程或 Tap。
+- `runtime/voicelive.db` 使用 SQLite WAL、单写入连接和 `synchronous=FULL`，保存会话、字幕修订、segment 关联、语音清单和迁移账本；WAV/媒体仍存文件系统。字幕与播放状态先提交数据库再广播。内存历史最多 512 条，数据库历史完整保留。重启只恢复配置、元数据和字幕，所有运行状态恢复为 `Idle`，不会恢复进程或 Tap。
 - 旧 `runtime/sessions/*.json`、`runtime/subtitles/*.jsonl` 和已有语音 WAV 在启动时只读迁移并保留原文件；迁移按 revision/timeline 重置拆分重复旧 cue，使用确定性 UUID 和逐行账本保证可重入。媒体、模型日志和 TTS 缓存也在 `runtime/` 下。
 - [crates/core/src/export.rs](crates/core/src/export.rs) 从同一 SQLite 只读事务快照固定字幕 revision 和语音清单；SRT 保留文本，VTT 转义 `&`/`<`/`>`。WAV 严格校验 ready 状态、PCM16 格式和完整数据，以 64 KiB 缓冲流式拼接，fsync 后通过唯一临时文件原子发布；缺段、截断、格式不一致或读取期间文件变化均报错。
 

@@ -152,7 +152,7 @@ async fn main() {
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(auth, authorize))
         .layer(middleware::from_fn(contract::request_context));
-    tracing::info!("EchoNote listening on http://{address}");
+    tracing::info!("VoiceLive listening on http://{address}");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             #[cfg(unix)]

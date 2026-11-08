@@ -10,7 +10,7 @@ import { chromium } from "playwright";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
 async function main() {
-const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "echonote-browser-acceptance-"));
+const runtime = fs.mkdtempSync(path.join(os.tmpdir(), "voicelive-browser-acceptance-"));
 const logPath = path.join(runtime, "core.log");
 const log = fs.openSync(logPath, "a");
 let core;
@@ -117,14 +117,14 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
   await page.locator("#playToggle").click();
   await waitFor(async () => (await api(`/api/sessions/${id}`)).state === "paused", "UI did not pause");
 
-  await page.locator("#sessionTitle").fill("产品验收 · 回响");
+  await page.locator("#sessionTitle").fill("产品验收 · 声译");
   const renameResponseEvent = page.waitForResponse(response => response.url().includes(`/api/sessions/${id}/title`));
   await page.locator("#sessionTitle").press("Enter");
   const renameResponse = await renameResponseEvent;
   assert.equal(renameResponse.status(), 200, await renameResponse.text());
-  await page.waitForFunction(() => document.querySelector(".session-item-title")?.textContent === "产品验收 · 回响");
+  await page.waitForFunction(() => document.querySelector(".session-item-title")?.textContent === "产品验收 · 声译");
   await page.locator('#strategyControl [data-policy="complete"]').click();
-  await page.waitForFunction(() => localStorage.getItem("echonote.policy") === "complete");
+  await page.waitForFunction(() => localStorage.getItem("voicelive.policy") === "complete");
   await page.locator("#openSettings").click();
   await page.waitForSelector('#panelContent .policy-card.selected[data-policy="complete"]');
   assert.equal(await page.locator("#panelTitle").textContent(), "设置");
@@ -149,12 +149,12 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
   await page.locator("#closePanel").click();
 
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForFunction(() => document.querySelector("#sessionTitle")?.value === "产品验收 · 回响");
+  await page.waitForFunction(() => document.querySelector("#sessionTitle")?.value === "产品验收 · 声译");
   await page.waitForSelector(".segment");
   assert.equal(await page.locator("#sessionTotal").textContent(), "01");
   assert.equal(await page.locator('#strategyControl [data-policy="complete"]').getAttribute("aria-pressed"), "true");
-  assert.equal(await page.evaluate(() => localStorage.getItem("echonote.session")), id);
-  await page.screenshot({ path: path.join(root, "runtime", "echonote-desktop-acceptance.png"), fullPage: true });
+  assert.equal(await page.evaluate(() => localStorage.getItem("voicelive.session")), id);
+  await page.screenshot({ path: path.join(root, "runtime", "voicelive-desktop-acceptance.png"), fullPage: true });
 
   await page.goto(`http://127.0.0.1:${port}/?debug=1`, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#openSettings");
@@ -169,7 +169,7 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
 
   await page.locator("#newSession").click();
   await page.waitForFunction(() => document.querySelector("#sessionTotal")?.textContent === "02");
-  const secondId = await page.evaluate(() => localStorage.getItem("echonote.session"));
+  const secondId = await page.evaluate(() => localStorage.getItem("voicelive.session"));
   assert.equal((await api(`/api/sessions/${secondId}`)).state, "idle");
   assert.equal((await api(`/api/sessions/${id}`)).state, "paused");
 
@@ -209,7 +209,7 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
   await fileChooser.setFiles({ name: "本地验收.wav", mimeType: "audio/wav", buffer: wav });
   await page.waitForFunction(() => document.querySelector("#sessionTitle")?.value === "本地验收.wav");
   await page.waitForFunction(() => document.querySelector("#sessionTotal")?.textContent === "03");
-  const mediaId = await page.evaluate(() => localStorage.getItem("echonote.session"));
+  const mediaId = await page.evaluate(() => localStorage.getItem("voicelive.session"));
   let snapshot = await api(`/api/sessions/${mediaId}`);
   assert.equal(snapshot.state, "idle");
   assert.equal(snapshot.config.source.type, "file");
@@ -223,16 +223,16 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
   assert.equal(await page.locator("#toastRegion .toast").count(), 0);
 
   for (const current of [mediaId, secondId]) {
-    assert.equal(await page.evaluate(() => localStorage.getItem("echonote.session")), current);
+    assert.equal(await page.evaluate(() => localStorage.getItem("voicelive.session")), current);
     await page.locator("#openInfo").click();
     await page.locator("#deleteCurrent").click();
     await page.waitForSelector("#deleteModal:not([hidden])");
     await page.locator("#confirmDelete").click();
     await page.waitForFunction(() => document.querySelector("#deleteModal")?.hidden);
-    await waitFor(async () => (await page.evaluate(() => localStorage.getItem("echonote.session"))) !== current, "active session did not change after deletion");
+    await waitFor(async () => (await page.evaluate(() => localStorage.getItem("voicelive.session"))) !== current, "active session did not change after deletion");
   }
   await page.waitForFunction(() => document.querySelector("#sessionTotal")?.textContent === "01");
-  assert.equal(await page.locator("#sessionTitle").inputValue(), "产品验收 · 回响");
+  assert.equal(await page.locator("#sessionTitle").inputValue(), "产品验收 · 声译");
 
   const desktop = await layout();
   assert.ok(desktop.documentWidth <= desktop.width, JSON.stringify(desktop));
@@ -250,9 +250,9 @@ fs.mkdirSync(path.join(root, "runtime"), { recursive: true });
   assert.ok(mobile.documentHeight <= mobile.height, JSON.stringify(mobile));
   assert.equal(mobile.bodyWidth, mobile.documentWidth);
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForFunction(() => document.querySelector("#sessionTitle")?.value === "产品验收 · 回响");
+  await page.waitForFunction(() => document.querySelector("#sessionTitle")?.value === "产品验收 · 声译");
   await page.waitForSelector(".segment");
-  await page.screenshot({ path: path.join(root, "runtime", "echonote-mobile-acceptance.png"), fullPage: true });
+  await page.screenshot({ path: path.join(root, "runtime", "voicelive-mobile-acceptance.png"), fullPage: true });
   assert.deepEqual(errors, []);
 
   await api(`/api/sessions/${id}/stop-model`, "POST", {});

@@ -873,7 +873,7 @@ components:
       type: http
 info:
   description: Loopback-only, bearer-authenticated REST and WebSocket API. Error responses use ErrorInfo and every response carries X-Request-Id.
-  title: EchoNote Local Control Plane
+  title: VoiceLive Local Control Plane
   version: simulmt.api.v1
 openapi: 3.0.4
 paths:

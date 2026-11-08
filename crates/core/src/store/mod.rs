@@ -53,7 +53,7 @@ pub(crate) struct Store {
 impl Store {
     pub fn open(runtime_dir: &Path) -> Result<Arc<Self>> {
         fs::create_dir_all(runtime_dir)?;
-        let connection = Connection::open(runtime_dir.join("echonote.db"))
+        let connection = Connection::open(runtime_dir.join("voicelive.db"))
             .map_err(|error| CoreError::Storage(error.to_string()))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
@@ -692,7 +692,7 @@ fn migrate_subtitles(connection: &Connection, runtime_dir: &Path, session_id: Uu
 fn stable_legacy_cue_id(session_id: Uuid, line_number: usize, occurrence: u64) -> String {
     Uuid::new_v5(
         &Uuid::NAMESPACE_OID,
-        format!("echonote-legacy-cue:{session_id}:{line_number}:{occurrence}").as_bytes(),
+        format!("voicelive-legacy-cue:{session_id}:{line_number}:{occurrence}").as_bytes(),
     )
     .to_string()
 }

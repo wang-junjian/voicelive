@@ -27,7 +27,7 @@ jobs:
       - name: Build Core and native helpers
         run: ./build.sh
       - name: Run isolated HTTP acceptance
-        run: python3 tests/pipeline/acceptance_echonote.py
+        run: python3 tests/pipeline/acceptance_voicelive.py
       - name: Run WebSocket contract acceptance
         run: node tests/pipeline/ws_resync.mjs
       - name: Install browser test dependencies

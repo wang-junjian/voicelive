@@ -1,4 +1,4 @@
-# 回响 EchoNote
+# 声译 VoiceLive
 
 本地实时语音同传工作台：把系统／应用声音、麦克风或本地音视频变成一条可回读、可导出的双语会话时间线。当前实现 M0～M2 的核心链路，macOS 为首个完整支持平台。
 
@@ -13,7 +13,7 @@
   - 自然流畅：连续调度与温和追平，兼顾实时性和听感。
   - 完整优先：充分组句、固定原速、不跳句，允许更高延迟以保留全部译文语音。
 - **会话信息与导出**：在会话信息中查看时间、方向和状态，下载双语 SRT、VTT 或译文 WAV，或删除整个会话。
-- **持久化**：会话配置、名称、时间、字幕修订和语音清单位于 `runtime/echonote.db`（SQLite WAL）；WAV 仍保存为文件。旧 `sessions/*.json`、`subtitles/*.jsonl` 与已有语音 WAV 在启动时只读迁移，原文件保留，重复迁移不会重复字幕。当前会话、界面偏好等保存在浏览器本地存储。窗口级页面不滚动，仅会话列表和时间线等局部区域滚动。
+- **持久化**：会话配置、名称、时间、字幕修订和语音清单位于 `runtime/voicelive.db`（SQLite WAL）；WAV 仍保存为文件。旧 `sessions/*.json`、`subtitles/*.jsonl` 与已有语音 WAV 在启动时只读迁移，原文件保留，重复迁移不会重复字幕。当前会话、界面偏好等保存在浏览器本地存储。窗口级页面不滚动，仅会话列表和时间线等局部区域滚动。
 
 诊断面板默认隐藏，可通过 `./run.sh --debug`、URL `?debug=1` 或 `Ctrl + Shift + D` 打开。模拟链路、实时链路、音频账本和会话诊断位于该面板。
 
@@ -84,7 +84,7 @@ npm run dev -- --host 127.0.0.1 --port 7100
 
 ```bash
 cargo test --workspace --locked
-python3 tests/pipeline/acceptance_echonote.py  # 自行启动隔离 Core，使用 mock 链路
+python3 tests/pipeline/acceptance_voicelive.py  # 自行启动隔离 Core，使用 mock 链路
 python3 tests/pipeline/security_boundary.py   # 认证、来源、路径和非 loopback 负向验收
 node tests/pipeline/ws_resync.mjs           # baseline、重连、序号与统一错误契约
 npm install

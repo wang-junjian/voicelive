@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Negative security acceptance for the loopback-only EchoNote control plane."""
+"""Negative security acceptance for the loopback-only VoiceLive control plane."""
 
 import base64
 import json

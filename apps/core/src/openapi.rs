@@ -178,7 +178,7 @@ fn document() -> Value {
     json!({
         "openapi": "3.0.4",
         "info": {
-            "title": "EchoNote Local Control Plane",
+            "title": "VoiceLive Local Control Plane",
             "version": API_VERSION,
             "description": "Loopback-only, bearer-authenticated REST and WebSocket API. Error responses use ErrorInfo and every response carries X-Request-Id."
         },

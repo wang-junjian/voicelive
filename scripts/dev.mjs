@@ -32,7 +32,7 @@ for (let attempt = 0; attempt < 80; attempt++) {
     const response = await fetch(`http://${host}:${port}/api/health`);
     if (response.ok) {
       const bootstrap = JSON.parse(fs.readFileSync(path.join(runtime, "bootstrap.json"), "utf8"));
-      console.log(`EchoNote console: ${bootstrap.url}/#auth=${bootstrap.token}`);
+      console.log(`VoiceLive console: ${bootstrap.url}/#auth=${bootstrap.token}`);
       announced = true;
       break;
     }
@@ -40,6 +40,6 @@ for (let attempt = 0; attempt < 80; attempt++) {
   await new Promise(resolve => setTimeout(resolve, 250));
 }
 if (!announced && child.exitCode === null) {
-  console.error("EchoNote Core did not become ready");
+  console.error("VoiceLive Core did not become ready");
   child.kill("SIGTERM");
 }

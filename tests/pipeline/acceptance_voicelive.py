@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated HTTP acceptance for EchoNote; uses mocks and never opens audio devices."""
+"""Isolated HTTP acceptance for VoiceLive; uses mocks and never opens audio devices."""
 
 import json
 import math
@@ -145,8 +145,8 @@ def main():
             core.start()
             session = request("/api/sessions", "POST", mock_config())
             sid = session["session_id"]
-            session = request(f"/api/sessions/{sid}/title", "PUT", {"title": "验收 · 回响"})
-            assert session["title"] == "验收 · 回响"
+            session = request(f"/api/sessions/{sid}/title", "PUT", {"title": "验收 · 声译"})
+            assert session["title"] == "验收 · 声译"
             session = request(
                 f"/api/sessions/{sid}/latency-mode", "PUT", {"latency_mode": "complete"}
             )
@@ -183,7 +183,7 @@ def main():
             core.start()
             restored = request(f"/api/sessions/{sid}")
             assert restored["state"] == "idle", restored
-            assert restored["title"] == "验收 · 回响"
+            assert restored["title"] == "验收 · 声译"
             assert restored["config"]["latency_mode"] == "complete"
             assert restored["metrics"]["captured_duration_us"] > 0
             restored_settings = request(f"/api/sessions/{settings_id}")
